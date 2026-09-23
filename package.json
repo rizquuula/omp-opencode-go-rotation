@@ -22,7 +22,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
     "typecheck": "tsc --noEmit",
-    "test": "bun test test/config-store.test.ts test/watchdog.test.ts",
+    "test": "bun test test/config-store.test.ts test/watchdog.test.ts test/usage-report.test.ts test/usage-command.test.ts",
     "prepack": "bun run build"
   },
   "repository": {

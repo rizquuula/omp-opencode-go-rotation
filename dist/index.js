@@ -1,7 +1,7 @@
 import { ConfigLoadError, DEFAULT_COOLDOWN_MINUTES, DEFAULT_WATCHDOG_IDLE_MS, createEmptyConfig, loadConfig, updateConfig, } from "./config-store.js";
+import { collectUsageReports, fetchOpenCodeGoUsage, formatQuotaReport, formatResetIn, formatUsageReport, formatUsageStatus, isRecord, } from "./usage-report.js";
+export { parseOpenCodeGoUsage, formatResetIn, formatUsageStatus, } from "./usage-report.js";
 const PROVIDER = "opencode-go";
-const OPENCODE_GO_USAGE_URL = "https://opencode.ai/zen/go/v1/usage";
-const OPENCODE_GO_USAGE_TIMEOUT_MS = 10_000;
 const FIXED_WINDOW_QUOTA_RE = /\b(?:5[- ]hour|weekly|monthly)\b[\s\S]*\b(?:usage\s+)?(?:quota|limit)\b|\b(?:usage|plan)\s+allocated\s+quota\s+exceeded\b|\b(?:quota|limit)\b[\s\S]*\b(?:will\s+reset|resets?\s+at|fixed[- ]window)\b/i;
 const TRANSIENT_RATE_LIMIT_RE = /\b429\b|rate.?limit|too many requests|quota|usage limit|limit reached/i;
 function getCooldownMs(config) {
@@ -330,125 +330,6 @@ function isRotationOperationCurrent(operation, config, epoch) {
         && config.activeKeyIndex === operation.selection.keyIndex
         && matchesSelectionSnapshot(config, operation.selection, operation.currentTime);
 }
-function isRecord(value) {
-    return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-function readString(record, keys) {
-    for (const key of keys) {
-        const value = record[key];
-        if (typeof value === "string")
-            return value;
-    }
-    return undefined;
-}
-function readNumber(record, keys) {
-    for (const key of keys) {
-        const value = record[key];
-        if (typeof value === "number" && Number.isFinite(value))
-            return value;
-    }
-    return undefined;
-}
-function parseOpenCodeGoUsageWindow(value) {
-    if (!isRecord(value))
-        return undefined;
-    const status = value.status === "ok" || value.status === "active"
-        ? "active"
-        : value.status === "rate-limited" ? "rate-limited" : "unknown";
-    const name = readString(value, ["name", "window", "period", "label"]);
-    const usagePercent = readNumber(value, ["usagePercent", "usage_percent", "percent"]);
-    const resetInSec = readNumber(value, ["resetInSec", "reset_in_sec", "resetSeconds", "reset_seconds"]);
-    const used = readNumber(value, ["used", "usage", "usedTokens"]);
-    const limit = readNumber(value, ["limit", "quota", "total"]);
-    const remaining = readNumber(value, ["remaining", "remainingTokens"]);
-    const resetAt = readString(value, ["resetAt", "reset_at", "resetsAt", "resets_at"]);
-    const startAt = readString(value, ["startAt", "start_at", "startsAt", "starts_at"]);
-    const endAt = readString(value, ["endAt", "end_at", "endsAt", "ends_at"]);
-    return {
-        status,
-        ...(name === undefined ? {} : { name }),
-        ...(usagePercent === undefined ? {} : { usagePercent }),
-        ...(resetInSec === undefined ? {} : { resetInSec }),
-        ...(used === undefined ? {} : { used }),
-        ...(limit === undefined ? {} : { limit }),
-        ...(remaining === undefined ? {} : { remaining }),
-        ...(resetAt === undefined ? {} : { resetAt }),
-        ...(startAt === undefined ? {} : { startAt }),
-        ...(endAt === undefined ? {} : { endAt }),
-    };
-}
-export function parseOpenCodeGoUsage(value) {
-    if (!isRecord(value))
-        return undefined;
-    const windows = [];
-    if (Array.isArray(value.windows)) {
-        for (const window of value.windows) {
-            const parsed = parseOpenCodeGoUsageWindow(window);
-            if (!parsed)
-                return undefined;
-            windows.push(parsed);
-        }
-        return { windows };
-    }
-    if (!isRecord(value.usage))
-        return undefined;
-    for (const [name, window] of Object.entries(value.usage)) {
-        const parsed = parseOpenCodeGoUsageWindow(window);
-        if (!parsed)
-            return undefined;
-        windows.push(parsed.name === undefined ? { ...parsed, name } : parsed);
-    }
-    return { windows };
-}
-async function fetchOpenCodeGoUsage(target, fetchApi, timers) {
-    if (!target)
-        return { ok: false, message: "No OpenCode keys configured." };
-    const controller = new AbortController();
-    const timeoutFailure = { ok: false, keyName: target.keyName, message: "Usage request timed out after 10s." };
-    const timerApi = timers ?? {
-        setTimeout: (callback, ms) => globalThis.setTimeout(callback, ms),
-        clearTimeout: (timer) => globalThis.clearTimeout(timer),
-    };
-    let didTimeout = false;
-    let timeout;
-    const request = (async () => {
-        try {
-            const response = await fetchApi(OPENCODE_GO_USAGE_URL, {
-                method: "GET",
-                headers: {
-                    Accept: "application/json",
-                    Authorization: `Bearer ${target.bearerToken}`,
-                },
-                signal: controller.signal,
-            });
-            if (!response.ok) {
-                return { ok: false, keyName: target.keyName, message: `Usage request failed with HTTP ${response.status}.` };
-            }
-            const usage = parseOpenCodeGoUsage(await response.json());
-            if (!usage)
-                return { ok: false, keyName: target.keyName, message: "Usage response did not match the expected OpenCode Go shape." };
-            return { ok: true, keyName: target.keyName, usage };
-        }
-        catch {
-            if (didTimeout)
-                return timeoutFailure;
-            return { ok: false, keyName: target.keyName, message: "Usage request failed." };
-        }
-    })();
-    const timedOut = new Promise((resolve) => {
-        timeout = timerApi.setTimeout(() => {
-            didTimeout = true;
-            controller.abort();
-            resolve(timeoutFailure);
-        }, OPENCODE_GO_USAGE_TIMEOUT_MS);
-    });
-    try {
-        return await Promise.race([request, timedOut]);
-    }
-    finally {
-        timerApi.clearTimeout(timeout);
-    }
-}
 function captureUsageDecision(config, epoch) {
     const target = getActiveUsageTarget(config);
     return target ? { epoch, target } : undefined;
@@ -546,50 +427,20 @@ function reindexAfterRemoval(record, removedIndex) {
     }
     return shifted;
 }
-function formatUsageAmount(value) {
-    return value === undefined ? undefined : value.toLocaleString("en-US");
-}
-export function formatResetIn(seconds) {
-    if (seconds <= 0)
-        return "now";
-    const days = Math.floor(seconds / 86_400);
-    const hours = Math.floor((seconds % 86_400) / 3_600);
-    const minutes = Math.ceil((seconds % 3_600) / 60);
-    if (days > 0)
-        return hours > 0 ? `${days}d ${hours}h` : `${days}d`;
-    if (hours > 0)
-        return minutes > 0 ? `${hours}h ${minutes}m` : `${hours}h`;
-    return minutes > 0 ? `${minutes}m` : "less than 1m";
-}
-function formatUsageWindow(window, index) {
-    const label = window.name ?? `window ${index + 1}`;
-    const details = [`${label}: ${window.status}`];
-    const used = formatUsageAmount(window.used);
-    const limit = formatUsageAmount(window.limit);
-    const remaining = formatUsageAmount(window.remaining);
-    if (window.usagePercent !== undefined)
-        details.push(`${Math.round(window.usagePercent)}% used`);
-    if (used !== undefined && limit !== undefined)
-        details.push(`${used}/${limit} used`);
-    else if (used !== undefined)
-        details.push(`${used} used`);
-    if (remaining !== undefined)
-        details.push(`${remaining} remaining`);
-    if (window.resetInSec !== undefined)
-        details.push(`resets in ${formatResetIn(window.resetInSec)}`);
-    else if (window.resetAt)
-        details.push(`resets ${window.resetAt}`);
-    else if (window.endAt)
-        details.push(`ends ${window.endAt}`);
-    return details.join("; ");
-}
-export function formatUsageStatus(result) {
-    if (!result.ok) {
-        return `OpenCode usage unavailable${result.keyName ? ` for ${result.keyName}` : ""}: ${result.message}`;
+/**
+ * The restriction a key carries right now, in the wording `/opencode status` and `/opencode usage`
+ * share: `quota-blocked 2h 10m`, `cooldown 3m`, or nothing when the key is free.
+ */
+function formatKeyStateTag(config, keyIndex, currentTime) {
+    const blockedUntil = getQuotaBlockedUntil(config, keyIndex, currentTime);
+    if (blockedUntil !== undefined) {
+        return `quota-blocked ${formatResetIn(Math.ceil((blockedUntil - currentTime) / 1000))}`;
     }
-    if (result.usage.windows.length === 0)
-        return `OpenCode usage for ${result.keyName}: no usage windows returned.`;
-    return [`OpenCode usage for ${result.keyName}:`, ...result.usage.windows.map(formatUsageWindow)].join("\n");
+    const cooldownStart = config.cooldowns[keyIndex];
+    if (cooldownStart === undefined)
+        return undefined;
+    const remaining = cooldownStart + getCooldownMs(config) - currentTime;
+    return remaining > 0 ? `cooldown ${Math.ceil(remaining / 60_000)}m` : undefined;
 }
 function formatStatus(config, now = Date.now()) {
     const watchdogStatus = `Watchdog: ${config.watchdogEnabled ? "on" : "off"} (${Math.ceil(getWatchdogIdleMs(config) / 1000)}s idle)`;
@@ -597,22 +448,32 @@ function formatStatus(config, now = Date.now()) {
     if (config.keys.length === 0) {
         return `No keys configured. Use /opencode add <name> <key>.\n${watchdogStatus}\n${cadenceStatus}`;
     }
-    const cdMs = getCooldownMs(config);
     return `${config.keys.map((key, i) => {
         const marker = i === config.activeKeyIndex ? "→" : " ";
-        const cooldownStart = config.cooldowns[i];
-        let tag = "";
-        const quotaReset = getQuotaBlockedUntil(config, i, now);
-        if (quotaReset !== undefined) {
-            tag = ` [quota-blocked ${formatResetIn(Math.ceil((quotaReset - now) / 1000))}]`;
-        }
-        else if (cooldownStart !== undefined) {
-            const remaining = cdMs - (now - cooldownStart);
-            if (remaining > 0)
-                tag = ` [cooldown ${Math.ceil(remaining / 60_000)}m]`;
-        }
-        return `${marker} ${i + 1}. ${key.name}${tag}`;
+        const stateTag = formatKeyStateTag(config, i, now);
+        return `${marker} ${i + 1}. ${key.name}${stateTag === undefined ? "" : ` [${stateTag}]`}`;
     }).join("\n")}\n${watchdogStatus}\n${cadenceStatus}`;
+}
+/**
+ * The recorded restrictions of one key plus what its usage reading says. A failed reading carries
+ * no window names, so a key whose request failed never reports a rate-limited window.
+ */
+function toQuotaKeyState(config, report, currentTime) {
+    const blockedUntil = getQuotaBlockedUntil(config, report.keyIndex, currentTime);
+    const cooldownStart = config.cooldowns[report.keyIndex];
+    const cooldownUntil = cooldownStart === undefined ? undefined : cooldownStart + getCooldownMs(config);
+    return {
+        keyIndex: report.keyIndex,
+        keyName: report.keyName,
+        active: report.active,
+        ...(blockedUntil === undefined ? {} : { blockedForSec: Math.ceil((blockedUntil - currentTime) / 1000) }),
+        ...(cooldownUntil === undefined || cooldownUntil <= currentTime
+            ? {}
+            : { coolingForSec: Math.ceil((cooldownUntil - currentTime) / 1000) }),
+        rateLimitedWindows: report.result.ok
+            ? report.result.usage.windows.flatMap((window, index) => window.status === "rate-limited" ? [window.name ?? `window ${index + 1}`] : [])
+            : [],
+    };
 }
 function formatDuration(ms) {
     const seconds = Math.max(0, Math.ceil(ms / 1000));
@@ -1306,6 +1167,28 @@ export function createOpencodeGoRotationExtension(options = {}) {
             const keyName = applyActiveKey(config, ctx.modelRegistry, currentTime);
             ctx.ui.notify(`OpenCode: Proactive rate-limit detection (HTTP 429) → rotated to ${keyName ?? `key-${outcome.keyIndex + 1}`}`, "info");
         });
+        /**
+         * One usage pass over every configured key: synchronize the active key first, query each
+         * key with its own bearer, then stamp each reading with the restriction that key carries.
+         */
+        async function collectConfiguredKeyReports(ctx) {
+            applySynchronizedActiveKey(ctx);
+            const targets = [];
+            for (let keyIndex = 0; keyIndex < config.keys.length; keyIndex++) {
+                const target = getUsageTargetForKeyIndex(config, keyIndex);
+                if (target)
+                    targets.push(target);
+            }
+            const reports = await collectUsageReports(targets, config.activeKeyIndex, fetchApi, options.timers);
+            const currentTime = now();
+            return {
+                currentTime,
+                reports: reports.map((report) => {
+                    const stateTag = formatKeyStateTag(config, report.keyIndex, currentTime);
+                    return stateTag === undefined ? report : { ...report, stateTag };
+                }),
+            };
+        }
         pi.registerCommand("opencode", {
             description: "Manage OpenCode API key rotation",
             handler: async (args, ctx) => {
@@ -1352,11 +1235,15 @@ export function createOpencodeGoRotationExtension(options = {}) {
                         ctx.ui.notify(formatWatchdogEvents(watchdogEvents, now()), "info");
                         break;
                     }
-                    case "usage":
+                    case "usage": {
+                        const { reports } = await collectConfiguredKeyReports(ctx);
+                        ctx.ui.notify(formatUsageReport(reports), reports.some((report) => report.result.ok) ? "info" : "warning");
+                        break;
+                    }
                     case "quota": {
-                        applySynchronizedActiveKey(ctx);
-                        const usage = await fetchOpenCodeGoUsage(getActiveUsageTarget(config), fetchApi, options.timers);
-                        ctx.ui.notify(formatUsageStatus(usage), usage.ok ? "info" : "warning");
+                        const { currentTime, reports } = await collectConfiguredKeyReports(ctx);
+                        const states = reports.map((report) => toQuotaKeyState(config, report, currentTime));
+                        ctx.ui.notify(formatQuotaReport(states), reports.some((report) => report.result.ok) ? "info" : "warning");
                         break;
                     }
                     case "use": {

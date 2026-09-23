@@ -1,11 +1,10 @@
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
+import { type FetchApi, type TimerApi } from "./usage-report.ts";
+export { parseOpenCodeGoUsage, formatResetIn, formatUsageStatus, } from "./usage-report.ts";
+export type { FetchApi, FetchResponseApi, OpenCodeGoUsageWindow, OpenCodeGoUsageWindowStatus, OpenCodeGoUsageResponse, TimerApi, UsageFetchResult, UsageLookupTarget, } from "./usage-report.ts";
 export declare function shouldWatchProvider(provider: string | undefined): boolean;
 export type RateLimitKind = "transient" | "fixed-window-quota";
 export declare function classifyRateLimitError(message: string): RateLimitKind | undefined;
-export interface TimerApi {
-    setTimeout(callback: () => void, ms: number): unknown;
-    clearTimeout(timer: unknown): void;
-}
 export type ProviderActivityPhase = "waiting-for-response" | "waiting-for-stream" | "streaming";
 export interface ProviderTimeoutInfo {
     phase: ProviderActivityPhase;
@@ -18,46 +17,11 @@ export declare function shouldRotateAfterWatchdogTimeout(timeoutInfo: ProviderTi
 export interface ClockApi {
     now(): number;
 }
-export interface FetchResponseApi {
-    ok: boolean;
-    status: number;
-    json(): Promise<unknown>;
-}
-export type FetchApi = (url: string, init: {
-    method: "GET";
-    headers: Record<string, string>;
-    signal?: AbortSignal;
-}) => Promise<FetchResponseApi>;
 export interface ExtensionOptions {
     timers?: TimerApi;
     clock?: ClockApi;
     fetch?: FetchApi;
 }
-export type OpenCodeGoUsageWindowStatus = "active" | "rate-limited" | "unknown";
-export interface OpenCodeGoUsageWindow {
-    name?: string;
-    status: OpenCodeGoUsageWindowStatus;
-    usagePercent?: number;
-    resetInSec?: number;
-    used?: number;
-    limit?: number;
-    remaining?: number;
-    resetAt?: string;
-    startAt?: string;
-    endAt?: string;
-}
-export interface OpenCodeGoUsageResponse {
-    windows: OpenCodeGoUsageWindow[];
-}
-type UsageFetchResult = {
-    ok: true;
-    keyName: string;
-    usage: OpenCodeGoUsageResponse;
-} | {
-    ok: false;
-    keyName?: string;
-    message: string;
-};
 export declare class ProviderIdleWatchdog {
     private timer;
     private active;
@@ -87,9 +51,6 @@ export declare class ProviderIdleWatchdog {
     private schedule;
     private clear;
 }
-export declare function parseOpenCodeGoUsage(value: unknown): OpenCodeGoUsageResponse | undefined;
-export declare function formatResetIn(seconds: number): string;
-export declare function formatUsageStatus(result: UsageFetchResult): string;
 export declare function createOpencodeGoRotationExtension(options?: ExtensionOptions): (pi: ExtensionAPI) => void;
 declare const extension: (pi: ExtensionAPI) => void;
 export default extension;

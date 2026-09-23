@@ -60,14 +60,15 @@ Four rotation paths exist:
 
 Keys that are quota-blocked or cooling down are skipped. Manual `/opencode use <n>` and `/opencode next` clear both restrictions on the selected key. Cooldowns default to 60 minutes; quota blocks expire at their persisted deadline.
 
-Usage commands use `https://opencode.ai/zen/go/v1/usage` and stop waiting after 10 seconds.
+Both usage commands read every configured key. They use `https://opencode.ai/zen/go/v1/usage` and stop waiting after 10 seconds for each key.
 
 ## Commands
 
 | Command | Description |
 |---------|-------------|
 | `/opencode` or `/opencode status` | Show all keys, the active key marker, cooldown and quota-blocked status, watchdog state, and cadence |
-| `/opencode usage` or `/opencode quota` | Fetch OpenCode Go usage for the active key without showing key material |
+| `/opencode usage` | Fetch OpenCode Go usage for every configured key, with the active key marked, and no key material |
+| `/opencode quota` | Show the quota state of every configured key, its rate-limited windows, and the earliest quota reset |
 | `/opencode use <n>` | Switch to key number `n` (1-based) and clear its cooldown and quota block |
 | `/opencode next` | Advance to the next configured key and clear its cooldown and quota block before activating it |
 | `/opencode add <name> <key>` | Add a new key |
@@ -122,7 +123,7 @@ bun run typecheck
 bun run test
 ```
 
-`bun run test` runs `test/config-store.test.ts` and `test/watchdog.test.ts`.
+`bun run test` runs `test/config-store.test.ts`, `test/watchdog.test.ts`, `test/usage-report.test.ts`, and `test/usage-command.test.ts`.
 
 `test/extension-hooks.test.ts` comes from upstream. It imports the `@mariozechner/*` runtime, so it does not run against omp. Keep it for reference when you merge upstream changes.
 
