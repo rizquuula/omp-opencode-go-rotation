@@ -1,4 +1,4 @@
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 export declare function shouldWatchProvider(provider: string | undefined): boolean;
 export type RateLimitKind = "transient" | "fixed-window-quota";
 export declare function classifyRateLimitError(message: string): RateLimitKind | undefined;

@@ -1,6 +1,8 @@
 export declare const CONFIG_PATH_ENV = "PI_OPENCODE_ROTATION_CONFIG";
 export declare const DEFAULT_COOLDOWN_MINUTES = 60;
 export declare const DEFAULT_WATCHDOG_IDLE_MS = 90000;
+/** 0 disables proactive cadence rotation. */
+export declare const DEFAULT_ROTATE_EVERY_REQUESTS = 0;
 export interface KeyEntry {
     name: string;
     key: string;
@@ -11,6 +13,8 @@ export interface Config {
     cooldownMinutes: number;
     watchdogEnabled: boolean;
     watchdogIdleMs: number;
+    /** Move to the next available key after this many provider requests. 0 disables cadence rotation. */
+    rotateEveryRequests: number;
     /** Key index → epoch ms when cooldown started */
     cooldowns: Record<number, number>;
     quotaBlockedUntil: Record<number, number>;

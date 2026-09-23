@@ -1,4 +1,4 @@
-import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import {
 	ConfigLoadError,
 	DEFAULT_COOLDOWN_MINUTES,
@@ -739,8 +739,9 @@ export function formatUsageStatus(result: UsageFetchResult): string {
 
 function formatStatus(config: Config, now = Date.now()): string {
 	const watchdogStatus = `Watchdog: ${config.watchdogEnabled ? "on" : "off"} (${Math.ceil(getWatchdogIdleMs(config) / 1000)}s idle)`;
+	const cadenceStatus = `Rotate every: ${config.rotateEveryRequests > 0 ? `${config.rotateEveryRequests} requests` : "off"}`;
 	if (config.keys.length === 0) {
-		return `No keys configured. Use /opencode add <name> <key>.\n${watchdogStatus}`;
+		return `No keys configured. Use /opencode add <name> <key>.\n${watchdogStatus}\n${cadenceStatus}`;
 	}
 	const cdMs = getCooldownMs(config);
 	return `${config.keys.map((key, i) => {
@@ -755,7 +756,7 @@ function formatStatus(config: Config, now = Date.now()): string {
 			if (remaining > 0) tag = ` [cooldown ${Math.ceil(remaining / 60_000)}m]`;
 		}
 		return `${marker} ${i + 1}. ${key.name}${tag}`;
-	}).join("\n")}\n${watchdogStatus}`;
+	}).join("\n")}\n${watchdogStatus}\n${cadenceStatus}`;
 }
 
 interface WatchdogEvent {
@@ -814,6 +815,8 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 		let watchdogRequestTimedOut = false;
 		let usageDecisionEpoch = 0;
 		let requestRateLimitState: RequestRateLimitState | undefined;
+		let cadenceCount = 0;
+		let cadenceKeyIndex = -1;
 		const watchdogEvents: WatchdogEvent[] = [];
 
 		const now = (): number => options.clock?.now() ?? Date.now();
@@ -872,8 +875,51 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 			usageDecisionEpoch++;
 		}
 
-		function beginProviderRequest(ctx: Pick<ExtensionContext, "modelRegistry">): void {
+		/** Next key that is neither quota-blocked nor cooling down, excluding the active one. */
+		function pickNextAvailableKeyIndex(currentConfig: Config, currentTime: number): number | undefined {
+			const cdMs = getCooldownMs(currentConfig);
+			for (let offset = 1; offset < currentConfig.keys.length; offset++) {
+				const idx = (currentConfig.activeKeyIndex + offset) % currentConfig.keys.length;
+				if (getQuotaBlockedUntil(currentConfig, idx, currentTime) !== undefined) continue;
+				const cooldownStart = currentConfig.cooldowns[idx];
+				if (cooldownStart === undefined || currentTime - cooldownStart >= cdMs) return idx;
+			}
+			return undefined;
+		}
+
+		/**
+		 * Proactive cadence rotation: after `rotateEveryRequests` provider requests on one key, move
+		 * to the next available key. Restricted keys are skipped, so the current key stays selected
+		 * while it is the only usable one.
+		 */
+		function rotateOnRequestCadence(ctx: Pick<ExtensionContext, "modelRegistry" | "ui">): void {
+			const limit = config.rotateEveryRequests;
+			if (limit <= 0) return;
+			if (cadenceKeyIndex !== config.activeKeyIndex) {
+				cadenceKeyIndex = config.activeKeyIndex;
+				cadenceCount = 0;
+			}
+			cadenceCount += 1;
+			if (cadenceCount < limit) return;
+			cadenceCount = 0;
+			const currentTime = now();
+			const previousIndex = config.activeKeyIndex;
+			const target = pickNextAvailableKeyIndex(config, currentTime);
+			if (target === undefined) return;
+			const selected = mutateSharedConfig((freshConfig) => {
+				// A rotation that landed while this decision was formed owns the selection.
+				if (freshConfig.activeKeyIndex !== previousIndex) return false;
+				freshConfig.activeKeyIndex = target;
+				return true;
+			});
+			if (selected !== true) return;
+			const keyName = applyActiveKey(config, ctx.modelRegistry, currentTime) ?? `key-${target + 1}`;
+			ctx.ui.notify(`OpenCode: Rotated to ${keyName} after ${limit} requests on the previous key`, "info");
+		}
+
+		function beginProviderRequest(ctx: Pick<ExtensionContext, "modelRegistry" | "ui">): void {
 			invalidateAutomaticDecisions();
+			rotateOnRequestCadence(ctx);
 			if (applySynchronizedActiveKey(ctx) === undefined) {
 				requestRateLimitState = undefined;
 				return;
@@ -1137,6 +1183,8 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 			lastAppliedRuntimeKeys.delete(ctx.modelRegistry);
 			invalidateAutomaticDecisions();
 			requestRateLimitState = undefined;
+			cadenceKeyIndex = -1;
+			cadenceCount = 0;
 			clearWatchdogTimeoutGuard();
 			if (!ensureConfig(ctx)) return;
 			// A block recorded in an earlier session can be stale: the plan was topped up, or the
@@ -1157,12 +1205,8 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 					if (!refreshConfig()) return;
 				}
 			}
-			// On reload: re-apply active key, skip auto-import
-			if (event.reason === "reload") {
-				const keyName = applySynchronizedActiveKey(ctx);
-				if (keyName) ctx.ui.notify(`OpenCode: Active key → ${keyName}`, "info");
-				return;
-			}
+			// omp exposes no reload reason on session_start, so every start re-applies the active
+			// key and only imports a stored credential when no key is configured yet.
 			if (config.keys.length === 0) {
 				if (await autoImportFromAuth(ctx)) {
 					const keyName = applySynchronizedActiveKey(ctx);
@@ -1205,15 +1249,11 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 
 			const timeoutInfo = stopWatchdog() ?? watchdogTimeoutInfo;
 			if (timeoutInfo || watchdogAbortPending) {
-				const errorMessage = watchdogAbortMessage ?? `OpenCode Go timeout: ${timeoutInfo ? formatTimeoutInfo(timeoutInfo) : "no provider activity"}; retrying.`;
+				// omp ignores handler results on `message_end`, so the watchdog cannot rewrite the
+				// aborted message into a retryable error. The timeout was already reported, and omp's
+				// own stream-idle and interrupted-turn recovery retries the turn.
 				resetWatchdogAbortState();
-				return {
-					message: {
-						...message,
-						stopReason: "error",
-						errorMessage,
-					},
-				};
+				return;
 			}
 
 			if (message.stopReason !== "error") {
@@ -1398,6 +1438,34 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 					case "ls": {
 						const status = formatStatus(config, now());
 						ctx.ui.notify(status, "info");
+						break;
+					}
+
+					case "rotate-every": {
+						const value = parts[1];
+						if (value === undefined || value === "status") {
+							ctx.ui.notify(
+								`Rotate every: ${config.rotateEveryRequests > 0 ? `${config.rotateEveryRequests} requests` : "off"}`,
+								"info",
+							);
+							return;
+						}
+						const requests = value === "off" ? 0 : parseInt(value, 10);
+						if (isNaN(requests) || requests < 0) {
+							ctx.ui.notify("Usage: /opencode rotate-every <n|off>", "warning");
+							return;
+						}
+						const result = mutateSharedConfig((freshConfig) => {
+							freshConfig.rotateEveryRequests = requests;
+							return true;
+						});
+						if (result !== true) {
+							if (configError) ctx.ui.notify(`OpenCode: ${configError}.`, "error");
+							return;
+						}
+						cadenceKeyIndex = -1;
+						cadenceCount = 0;
+						ctx.ui.notify(requests > 0 ? `Rotate every ${requests} requests` : "Rotate every: off", "info");
 						break;
 					}
 
@@ -1593,7 +1661,7 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 
 					default:
 						ctx.ui.notify(
-							"Usage: /opencode [status|usage|quota|events|use <n>|next|add <name> <key>|rm <n>|reset|cooldown <min>|watchdog [status|on|off|<seconds>]]",
+							"Usage: /opencode [status|usage|quota|events|use <n>|next|add <name> <key>|rm <n>|reset|cooldown <min>|rotate-every <n|off>|watchdog [status|on|off|<seconds>]]",
 							"info",
 						);
 				}

@@ -1,7 +1,7 @@
 {
-  "name": "@lnilluv/pi-opencode-go-rotation",
-  "version": "1.5.3",
-  "description": "Rotate between multiple OpenCode Go API keys with reactive 429, rate-limit, and watchdog stall detection",
+  "name": "omp-opencode-go-rotation",
+  "version": "1.6.0",
+  "description": "Rotate between multiple OpenCode Go API keys with reactive 429 handling, cadence rotation, and watchdog stall detection",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -9,6 +9,11 @@
     "dist",
     "README.md"
   ],
+  "omp": {
+    "extensions": [
+      "./dist/index.js"
+    ]
+  },
   "pi": {
     "extensions": [
       "./dist/index.js"
@@ -17,26 +22,24 @@
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
     "typecheck": "tsc --noEmit",
-    "test": "node --experimental-strip-types --test test/*.test.ts",
-    "prepack": "npm run build"
+    "test": "bun test test/config-store.test.ts test/watchdog.test.ts",
+    "prepack": "bun run build"
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/lnilluv/pi-opencode-go-rotation.git"
-  },
-  "peerDependencies": {
-    "@mariozechner/pi-coding-agent": ">=0.71.1"
+    "url": "git+https://github.com/rizquuula/omp-opencode-go-rotation.git"
   },
   "keywords": [
+    "omp-extension",
+    "omp-plugin",
     "pi-extension",
-    "pi-package",
     "opencode",
     "api-key-rotation",
     "rate-limit"
   ],
   "license": "MIT",
   "devDependencies": {
-    "@mariozechner/pi-coding-agent": "0.71.1",
+    "@oh-my-pi/pi-coding-agent": "^17.4.0",
     "typescript": "5.9.3"
   }
 }

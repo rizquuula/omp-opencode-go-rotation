@@ -5,6 +5,8 @@ import { randomUUID } from "node:crypto";
 export const CONFIG_PATH_ENV = "PI_OPENCODE_ROTATION_CONFIG";
 export const DEFAULT_COOLDOWN_MINUTES = 60;
 export const DEFAULT_WATCHDOG_IDLE_MS = 90_000;
+/** 0 disables proactive cadence rotation. */
+export const DEFAULT_ROTATE_EVERY_REQUESTS = 0;
 const CONFIG_FILE_MODE = 0o600;
 const LOCK_TIMEOUT_MS = 10_000;
 const LOCK_STALE_MS = 30_000;
@@ -24,12 +26,13 @@ export function createEmptyConfig() {
         cooldownMinutes: DEFAULT_COOLDOWN_MINUTES,
         watchdogEnabled: true,
         watchdogIdleMs: DEFAULT_WATCHDOG_IDLE_MS,
+        rotateEveryRequests: DEFAULT_ROTATE_EVERY_REQUESTS,
         cooldowns: {},
         quotaBlockedUntil: {},
     };
 }
 export function getConfigPath() {
-    return process.env[CONFIG_PATH_ENV] ?? join(homedir(), ".pi", "agent", "opencode-keys.json");
+    return process.env[CONFIG_PATH_ENV] ?? join(homedir(), ".omp", "agent", "opencode-keys.json");
 }
 function isRecord(value) {
     return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -77,12 +80,18 @@ function parseConfig(value, path) {
     if (typeof watchdogIdleMs !== "number" || !Number.isFinite(watchdogIdleMs) || watchdogIdleMs < 1) {
         throw new ConfigLoadError(path, "watchdogIdleMs is invalid");
     }
+    const rotateEveryRequestsValue = value.rotateEveryRequests;
+    const rotateEveryRequests = rotateEveryRequestsValue === undefined ? DEFAULT_ROTATE_EVERY_REQUESTS : rotateEveryRequestsValue;
+    if (typeof rotateEveryRequests !== "number" || !Number.isInteger(rotateEveryRequests) || rotateEveryRequests < 0) {
+        throw new ConfigLoadError(path, "rotateEveryRequests is invalid");
+    }
     return {
         keys,
         activeKeyIndex,
         cooldownMinutes,
         watchdogEnabled,
         watchdogIdleMs,
+        rotateEveryRequests,
         cooldowns: parseNumberRecord(value.cooldowns, "cooldowns", path),
         quotaBlockedUntil: parseNumberRecord(value.quotaBlockedUntil, "quotaBlockedUntil", path),
     };

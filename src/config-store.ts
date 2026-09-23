@@ -18,6 +18,8 @@ import { randomUUID } from "node:crypto";
 export const CONFIG_PATH_ENV = "PI_OPENCODE_ROTATION_CONFIG";
 export const DEFAULT_COOLDOWN_MINUTES = 60;
 export const DEFAULT_WATCHDOG_IDLE_MS = 90_000;
+/** 0 disables proactive cadence rotation. */
+export const DEFAULT_ROTATE_EVERY_REQUESTS = 0;
 
 const CONFIG_FILE_MODE = 0o600;
 const LOCK_TIMEOUT_MS = 10_000;
@@ -35,6 +37,8 @@ export interface Config {
 	cooldownMinutes: number;
 	watchdogEnabled: boolean;
 	watchdogIdleMs: number;
+	/** Move to the next available key after this many provider requests. 0 disables cadence rotation. */
+	rotateEveryRequests: number;
 	/** Key index → epoch ms when cooldown started */
 	cooldowns: Record<number, number>;
 	quotaBlockedUntil: Record<number, number>;
@@ -57,13 +61,14 @@ export function createEmptyConfig(): Config {
 		cooldownMinutes: DEFAULT_COOLDOWN_MINUTES,
 		watchdogEnabled: true,
 		watchdogIdleMs: DEFAULT_WATCHDOG_IDLE_MS,
+		rotateEveryRequests: DEFAULT_ROTATE_EVERY_REQUESTS,
 		cooldowns: {},
 		quotaBlockedUntil: {},
 	};
 }
 
 export function getConfigPath(): string {
-	return process.env[CONFIG_PATH_ENV] ?? join(homedir(), ".pi", "agent", "opencode-keys.json");
+	return process.env[CONFIG_PATH_ENV] ?? join(homedir(), ".omp", "agent", "opencode-keys.json");
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -116,12 +121,20 @@ function parseConfig(value: unknown, path: string): Config {
 		throw new ConfigLoadError(path, "watchdogIdleMs is invalid");
 	}
 
+	const rotateEveryRequestsValue = value.rotateEveryRequests;
+	const rotateEveryRequests =
+		rotateEveryRequestsValue === undefined ? DEFAULT_ROTATE_EVERY_REQUESTS : rotateEveryRequestsValue;
+	if (typeof rotateEveryRequests !== "number" || !Number.isInteger(rotateEveryRequests) || rotateEveryRequests < 0) {
+		throw new ConfigLoadError(path, "rotateEveryRequests is invalid");
+	}
+
 	return {
 		keys,
 		activeKeyIndex,
 		cooldownMinutes,
 		watchdogEnabled,
 		watchdogIdleMs,
+		rotateEveryRequests,
 		cooldowns: parseNumberRecord(value.cooldowns, "cooldowns", path),
 		quotaBlockedUntil: parseNumberRecord(value.quotaBlockedUntil, "quotaBlockedUntil", path),
 	};

@@ -1,12 +1,25 @@
-# pi-opencode-go-rotation
+# omp-opencode-go-rotation
 
-Rotate between multiple OpenCode Go API keys. The extension checks OpenCode Go usage when a 429 response arrives, rotates around quota-blocked and cooling-down keys, and recovers silent stalls detected by the watchdog.
+Rotate between multiple OpenCode Go API keys in [omp](https://omp.sh).
+
+The extension reacts to rate limits and stalls, and it can also rotate on a request-count cadence.
+
+Fork of [lnilluv/pi-opencode-go-rotation](https://github.com/lnilluv/pi-opencode-go-rotation) v1.5.3, ported to the omp extension API.
 
 ## Install
 
 ```bash
-pi install npm:@lnilluv/pi-opencode-go-rotation
+omp plugin install github:rizquuula/omp-opencode-go-rotation
 ```
+
+For local development, clone the repository and link it:
+
+```bash
+git clone https://github.com/rizquuula/omp-opencode-go-rotation ~/Playground/omp-opencode-go-rotation
+omp plugin link ~/Playground/omp-opencode-go-rotation
+```
+
+`dist/` is committed, so the linked or installed package runs without a build step.
 
 ## Setup
 
@@ -20,31 +33,28 @@ Add your API keys:
 
 The first key added becomes active immediately.
 
+When no key is configured, the extension imports the credential that omp already stores for `opencode-go`.
+
 ## How it works
 
-The extension sets the active key as a runtime override, which takes priority over `OPENCODE_API_KEY` environment variables and `auth.json` credentials.
+The extension sets the active key as a runtime API key override, so it takes priority over `OPENCODE_API_KEY`, `models.yml` keys, and credentials in `agent.db`.
 
-The extension has three recovery paths:
+Four rotation paths exist:
 
-1. **Usage-verified Go quota exhaustion**: when OpenCode Go returns HTTP 429, the extension sends the active key only to `https://opencode.ai/zen/go/v1/usage`. If a usage window is `rate-limited`, the failed key is blocked until the latest reported reset and the next non-quota-blocked key is activated. Rotation prefers keys outside transient cooldown, but can clear a cooldown rather than keep using an exhausted key. Repeated failures try each configured key once. When every key is quota-blocked, rotation stops and reports the earliest reset instead of cycling.
-2. **Transient limit errors**: when the usage endpoint is unavailable, does not report a rate-limited window, or does not finish within 10 seconds, the extension preserves the existing transient 429 behavior. It aborts a timed-out usage request, marks the current key as on cooldown, switches to the next key that is not quota-blocked, and applies it via `setRuntimeApiKey`.
-3. **Silent stalls**: when an `opencode-go` provider request has no response or stream activity for the watchdog window, the extension rotates to an eligible key, aborts the hung turn, and rewrites the abort as a retryable timeout error.
+1. **Usage-verified Go quota exhaustion**: when OpenCode Go returns HTTP 429, the extension sends the active key to `https://opencode.ai/zen/go/v1/usage`. If a usage window is `rate-limited`, the failed key is blocked until the reported reset, and the next non-blocked key becomes active.
+2. **Transient limit errors**: when the usage endpoint is unavailable, reports no rate-limited window, or does not answer within 10 seconds, the extension marks the current key as cooling down and switches to the next key that is not quota-blocked.
+3. **Silent stalls**: when an `opencode-go` request shows no response or stream activity for the watchdog window, the extension rotates to an eligible key and aborts the hung turn.
+4. **Cadence rotation**: when `rotateEveryRequests` is set, the extension moves to the next available key after that many provider requests, without waiting for an error.
 
-This is still reactive: it does not poll usage or check limits before normal requests.
+Keys that are quota-blocked or cooling down are skipped. Manual `/opencode use <n>` and `/opencode next` clear both restrictions on the selected key. Cooldowns default to 60 minutes; quota blocks expire at their persisted deadline.
 
-Fixed-window Go plan quota errors reported at message end follow the same rotation path. A parseable reset timestamp is authoritative; otherwise the configured cooldown duration is used as the block duration. A response-hook rotation is deduplicated so the matching message-end error cannot rotate twice.
-
-Pi's built-in auto-retry picks up the new key on the next request.
-
-Cooldowns default to 60 minutes. Quota blocks expire at their persisted deadline. Manual `/opencode use <n>` and `/opencode next` clear both restrictions on the selected key.
-
-Usage commands use `https://opencode.ai/zen/go/v1/usage` and stop waiting after 10 seconds. A timeout reports `Usage request timed out after 10s.`.
+Usage commands use `https://opencode.ai/zen/go/v1/usage` and stop waiting after 10 seconds.
 
 ## Commands
 
 | Command | Description |
 |---------|-------------|
-| `/opencode` or `/opencode status` | Show all keys, active key marker, cooldown and quota-blocked status |
+| `/opencode` or `/opencode status` | Show all keys, the active key marker, cooldown and quota-blocked status, watchdog state, and cadence |
 | `/opencode usage` or `/opencode quota` | Fetch OpenCode Go usage for the active key without showing key material |
 | `/opencode use <n>` | Switch to key number `n` (1-based) and clear its cooldown and quota block |
 | `/opencode next` | Advance to the next configured key and clear its cooldown and quota block before activating it |
@@ -52,12 +62,13 @@ Usage commands use `https://opencode.ai/zen/go/v1/usage` and stop waiting after 
 | `/opencode rm <n>` | Remove key number `n` |
 | `/opencode reset` | Clear all cooldowns and quota blocks |
 | `/opencode cooldown <min>` | Set or view cooldown duration in minutes |
+| `/opencode rotate-every <n\|off>` | Rotate to the next available key every `n` provider requests, or show the current cadence |
 | `/opencode events` | Show recent watchdog timeout history (last 10) |
 | `/opencode watchdog [status\|on\|off\|<seconds>]` | Configure silent-stall detection |
 
 ## Configuration
 
-Keys are stored in `~/.pi/agent/opencode-keys.json` with file permissions `0600`. Status output shows key names only; it does not display key material.
+Keys are stored in `~/.omp/agent/opencode-keys.json` with file permissions `0600`. Set `PI_OPENCODE_ROTATION_CONFIG` to use a different path. Status output shows key names only; it never shows key material.
 
 ```json
 {
@@ -69,35 +80,44 @@ Keys are stored in `~/.pi/agent/opencode-keys.json` with file permissions `0600`
   "cooldownMinutes": 60,
   "watchdogEnabled": true,
   "watchdogIdleMs": 90000,
+  "rotateEveryRequests": 20,
   "cooldowns": {},
   "quotaBlockedUntil": {}
 }
 ```
 
-### Retry settings
+`rotateEveryRequests` counts provider requests for the active key. The counter resets at session start and whenever the active key changes, so the value means "requests per key". `0` disables cadence rotation.
 
-Pair with pi's auto-retry for best results. In `~/.pi/agent/settings.json`:
+## omp-specific behavior
 
-```json
-{
-  "retry": {
-    "enabled": true,
-    "maxRetries": 3
-  }
-}
-```
-
-Set `maxRetries` to at least the number of keys so all keys get a chance before pi gives up.
+- `after_provider_response` runs only for successful responses in the omp `openai-completions` provider, because the non-2xx path throws before the notification. Rotation therefore triggers from the failed turn: the extension classifies the error message at `message_end` and switches the key.
+- omp ignores handler results on `message_end`. The watchdog still rotates and aborts a stalled turn, but it cannot rewrite the aborted message into a retryable error. omp's own stream-idle timeout and interrupted-turn recovery handle the retry.
+- omp already rotates stored credentials for a provider when a usage limit is reached. While this extension is active, its runtime key override takes priority, so this extension owns rotation for `opencode-go`.
+- Extension code is loaded when an omp process starts. Restart omp sessions after you update the plugin.
 
 ## Limitations
 
 - The watchdog is scoped to the `opencode-go` provider only. Other providers are not aborted or rotated.
-- A legitimate long-running request with no stream activity can be treated as stalled; tune with `/opencode watchdog <seconds>` or disable with `/opencode watchdog off`.
-- When all non-quota-blocked keys are transiently cooling down, the extension may clear the next eligible key's cooldown. It never automatically clears or force-selects a quota-blocked key.
-- When all keys are quota-blocked, automatic rotation stops on the current runtime key until a block expires or a manual command clears one.
-- Go plan usage limits are tied to the subscription workspace; multiple keys from one workspace should not be assumed to provide independent quota. See the [OpenCode Go documentation](https://opencode.ai/docs/go/).
-- Keys added via `/opencode add` are stored in plaintext. The config file is created and maintained with `0600` permissions.
+- A legitimate long-running request with no stream activity can be treated as stalled. Tune it with `/opencode watchdog <seconds>`, or disable it with `/opencode watchdog off`.
+- Cadence rotation loses provider-side prompt cache on each switch when the cache is scoped to the account.
+- Go plan limits are tied to the subscription workspace. Keys from one workspace may share one quota; rotation then spreads requests instead of adding capacity. See the [OpenCode Go documentation](https://opencode.ai/docs/go/).
+- Keys added through `/opencode add` are stored in plaintext, and the config file is created and maintained with `0600` permissions.
+
+## Tests
+
+```bash
+bun run typecheck
+bun run test
+```
+
+`bun run test` runs `test/config-store.test.ts` and `test/watchdog.test.ts`.
+
+`test/extension-hooks.test.ts` comes from upstream. It imports the `@mariozechner/*` runtime, so it does not run against omp. Keep it for reference when you merge upstream changes.
+
+## Releases
+
+Push `feat:` or `fix:` commits to `main` (or `dev`). The release workflow bumps the version, commits the bump, tags it, and creates a GitHub Release. It does not publish to npm.
 
 ## License
 
-MIT
+MIT. See [LICENSE](./LICENSE), which keeps the upstream copyright notice.
