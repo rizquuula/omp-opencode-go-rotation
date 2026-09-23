@@ -1,6 +1,6 @@
 {
   "name": "omp-opencode-go-rotation",
-  "version": "1.6.0",
+  "version": "1.7.0",
   "description": "Rotate between multiple OpenCode Go API keys with reactive 429 handling, cadence rotation, and watchdog stall detection",
   "type": "module",
   "main": "./dist/index.js",
