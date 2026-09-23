@@ -1,5 +1,5 @@
 import { ConfigLoadError, DEFAULT_COOLDOWN_MINUTES, DEFAULT_WATCHDOG_IDLE_MS, createEmptyConfig, loadConfig, updateConfig, } from "./config-store.js";
-import { collectUsageReports, fetchOpenCodeGoUsage, formatQuotaReport, formatResetIn, formatUsageReport, formatUsageStatus, isRecord, } from "./usage-report.js";
+import { collectUsageReports, createUsageCache, fetchOpenCodeGoUsage, formatCachedUsageSummary, formatQuotaReport, formatResetIn, formatUsageReport, formatUsageStatus, isRecord, toQuotaPayload, toUsagePayload, usageAgeSec, usageCacheKey, } from "./usage-report.js";
 export { parseOpenCodeGoUsage, formatResetIn, formatUsageStatus, } from "./usage-report.js";
 const PROVIDER = "opencode-go";
 const FIXED_WINDOW_QUOTA_RE = /\b(?:5[- ]hour|weekly|monthly)\b[\s\S]*\b(?:usage\s+)?(?:quota|limit)\b|\b(?:usage|plan)\s+allocated\s+quota\s+exceeded\b|\b(?:quota|limit)\b[\s\S]*\b(?:will\s+reset|resets?\s+at|fixed[- ]window)\b/i;
@@ -442,17 +442,19 @@ function formatKeyStateTag(config, keyIndex, currentTime) {
     const remaining = cooldownStart + getCooldownMs(config) - currentTime;
     return remaining > 0 ? `cooldown ${Math.ceil(remaining / 60_000)}m` : undefined;
 }
-function formatStatus(config, now = Date.now()) {
+function formatStatus(config, now = Date.now(), usageSummary) {
     const watchdogStatus = `Watchdog: ${config.watchdogEnabled ? "on" : "off"} (${Math.ceil(getWatchdogIdleMs(config) / 1000)}s idle)`;
     const cadenceStatus = `Rotate every: ${config.rotateEveryRequests > 0 ? `${config.rotateEveryRequests} requests` : "off"}`;
     if (config.keys.length === 0) {
         return `No keys configured. Use /opencode add <name> <key>.\n${watchdogStatus}\n${cadenceStatus}`;
     }
-    return `${config.keys.map((key, i) => {
+    const keyStatus = config.keys.map((key, i) => {
         const marker = i === config.activeKeyIndex ? "→" : " ";
         const stateTag = formatKeyStateTag(config, i, now);
         return `${marker} ${i + 1}. ${key.name}${stateTag === undefined ? "" : ` [${stateTag}]`}`;
-    }).join("\n")}\n${watchdogStatus}\n${cadenceStatus}`;
+    }).join("\n");
+    const usageStatus = usageSummary === undefined ? "" : `\n${usageSummary}`;
+    return `${keyStatus}\n${watchdogStatus}\n${cadenceStatus}${usageStatus}`;
 }
 /**
  * The recorded restrictions of one key plus what its usage reading says. A failed reading carries
@@ -473,6 +475,7 @@ function toQuotaKeyState(config, report, currentTime) {
         rateLimitedWindows: report.result.ok
             ? report.result.usage.windows.flatMap((window, index) => window.status === "rate-limited" ? [window.name ?? `window ${index + 1}`] : [])
             : [],
+        ...(report.ageSec === undefined ? {} : { ageSec: report.ageSec }),
     };
 }
 function formatDuration(ms) {
@@ -521,6 +524,8 @@ export function createOpencodeGoRotationExtension(options = {}) {
         const watchdogEvents = [];
         const now = () => options.clock?.now() ?? Date.now();
         const fetchApi = options.fetch ?? globalThis.fetch.bind(globalThis);
+        /** Readings the usage commands reuse for 60 s; the reactive 429 and watchdog paths never read it. */
+        const usageCache = createUsageCache();
         function formatConfigError(error) {
             if (error instanceof ConfigLoadError)
                 return error.message;
@@ -1170,8 +1175,9 @@ export function createOpencodeGoRotationExtension(options = {}) {
         /**
          * One usage pass over every configured key: synchronize the active key first, query each
          * key with its own bearer, then stamp each reading with the restriction that key carries.
+         * Readings from the last 60 s are reused unless the caller asks for a refresh.
          */
-        async function collectConfiguredKeyReports(ctx) {
+        async function collectConfiguredKeyReports(ctx, collectOptions = {}) {
             applySynchronizedActiveKey(ctx);
             const targets = [];
             for (let keyIndex = 0; keyIndex < config.keys.length; keyIndex++) {
@@ -1179,7 +1185,11 @@ export function createOpencodeGoRotationExtension(options = {}) {
                 if (target)
                     targets.push(target);
             }
-            const reports = await collectUsageReports(targets, config.activeKeyIndex, fetchApi, options.timers);
+            const reports = await collectUsageReports(targets, config.activeKeyIndex, fetchApi, options.timers, {
+                cache: usageCache,
+                now,
+                refresh: collectOptions.refresh ?? false,
+            });
             const currentTime = now();
             return {
                 currentTime,
@@ -1188,6 +1198,18 @@ export function createOpencodeGoRotationExtension(options = {}) {
                     return stateTag === undefined ? report : { ...report, stateTag };
                 }),
             };
+        }
+        /** What the cache holds right now, without fetching anything. */
+        function readCachedUsageReadings(currentTime) {
+            const readings = [];
+            for (let keyIndex = 0; keyIndex < config.keys.length; keyIndex++) {
+                const target = getUsageTargetForKeyIndex(config, keyIndex);
+                const entry = target === undefined ? undefined : usageCache.get(usageCacheKey(target), currentTime);
+                if (entry === undefined)
+                    continue;
+                readings.push({ result: entry.result, ageSec: usageAgeSec(entry.storedAt, currentTime) });
+            }
+            return readings;
         }
         pi.registerCommand("opencode", {
             description: "Manage OpenCode API key rotation",
@@ -1201,8 +1223,9 @@ export function createOpencodeGoRotationExtension(options = {}) {
                     case "status":
                     case "list":
                     case "ls": {
-                        const status = formatStatus(config, now());
-                        ctx.ui.notify(status, "info");
+                        const currentTime = now();
+                        const usageSummary = formatCachedUsageSummary(readCachedUsageReadings(currentTime));
+                        ctx.ui.notify(formatStatus(config, currentTime, usageSummary), "info");
                         break;
                     }
                     case "rotate-every": {
@@ -1236,14 +1259,18 @@ export function createOpencodeGoRotationExtension(options = {}) {
                         break;
                     }
                     case "usage": {
-                        const { reports } = await collectConfiguredKeyReports(ctx);
-                        ctx.ui.notify(formatUsageReport(reports), reports.some((report) => report.result.ok) ? "info" : "warning");
+                        const { reports } = await collectConfiguredKeyReports(ctx, { refresh: parts.includes("--refresh") });
+                        const level = reports.some((report) => report.result.ok) ? "info" : "warning";
+                        const report = parts.includes("--json") ? JSON.stringify(toUsagePayload(reports)) : formatUsageReport(reports);
+                        ctx.ui.notify(report, level);
                         break;
                     }
                     case "quota": {
-                        const { currentTime, reports } = await collectConfiguredKeyReports(ctx);
+                        const { currentTime, reports } = await collectConfiguredKeyReports(ctx, { refresh: parts.includes("--refresh") });
                         const states = reports.map((report) => toQuotaKeyState(config, report, currentTime));
-                        ctx.ui.notify(formatQuotaReport(states), reports.some((report) => report.result.ok) ? "info" : "warning");
+                        const level = reports.some((report) => report.result.ok) ? "info" : "warning";
+                        const report = parts.includes("--json") ? JSON.stringify(toQuotaPayload(states)) : formatQuotaReport(states);
+                        ctx.ui.notify(report, level);
                         break;
                     }
                     case "use": {
@@ -1430,7 +1457,7 @@ export function createOpencodeGoRotationExtension(options = {}) {
                         break;
                     }
                     default:
-                        ctx.ui.notify("Usage: /opencode [status|usage|quota|events|use <n>|next|add <name> <key>|rm <n>|reset|cooldown <min>|rotate-every <n|off>|watchdog [status|on|off|<seconds>]]", "info");
+                        ctx.ui.notify("Usage: /opencode [status|usage|quota [--refresh|--json]|events|use <n>|next|add <name> <key>|rm <n>|reset|cooldown <min>|rotate-every <n|off>|watchdog [status|on|off|<seconds>]]", "info");
                 }
             },
         });

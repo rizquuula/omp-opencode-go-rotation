@@ -2,8 +2,10 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
 	collectUsageReports,
+	createUsageCache,
 	formatQuotaReport,
 	formatUsageReport,
+	USAGE_CACHE_TTL_MS,
 	type FetchApi,
 	type KeyUsageReport,
 	type OpenCodeGoUsageWindow,
@@ -336,4 +338,111 @@ test("collectUsageReports gives each silent key its own 10 s window and starts t
 		{ ok: false, keyName: "opencode-rr", message: "Usage request timed out after 10s." },
 	]);
 	assert.equal(timers.size, 0);
+});
+
+/** A clock the cache tests advance by hand, in milliseconds. */
+class StepClock {
+	time = 0;
+
+	now = (): number => this.time;
+}
+
+const RR_TARGET: UsageLookupTarget = { keyIndex: 1, keyName: "opencode-rr", bearerToken: "token-rr" };
+
+test("collectUsageReports reuses a reading collected inside the TTL and labels how old it is", async () => {
+	const { fetchApi, requests } = recordingFetch(() => ({
+		ok: true,
+		status: 200,
+		body: { windows: [{ name: "weekly", status: "active", percent: 12 }] },
+	}));
+	const clock = new StepClock();
+	const cache = createUsageCache();
+
+	const first = await collectUsageReports(TARGETS, 0, fetchApi, undefined, { cache, now: clock.now });
+	assert.equal(requests.length, 2);
+	assert.deepEqual(first.map((report) => report.ageSec), [undefined, undefined]);
+
+	clock.time = 42_000;
+	const second = await collectUsageReports(TARGETS, 0, fetchApi, undefined, { cache, now: clock.now });
+
+	assert.equal(requests.length, 2);
+	assert.deepEqual(second.map((report) => report.ageSec), [42, 42]);
+	assert.deepEqual(second.map((report) => report.result), first.map((report) => report.result));
+});
+
+test("collectUsageReports refetches once a cached reading reaches the TTL", async () => {
+	const { fetchApi, requests } = recordingFetch(() => ({
+		ok: true,
+		status: 200,
+		body: { windows: [{ name: "weekly", status: "active", percent: 12 }] },
+	}));
+	const clock = new StepClock();
+	const cache = createUsageCache();
+
+	await collectUsageReports(TARGETS, 0, fetchApi, undefined, { cache, now: clock.now });
+	clock.time = USAGE_CACHE_TTL_MS;
+	const refreshed = await collectUsageReports(TARGETS, 0, fetchApi, undefined, { cache, now: clock.now });
+
+	assert.equal(requests.length, 4);
+	assert.deepEqual(refreshed.map((report) => report.ageSec), [undefined, undefined]);
+});
+
+test("collectUsageReports treats a replaced bearer at the same index as a different key", async () => {
+	const { fetchApi, requests } = recordingFetch(() => ({
+		ok: true,
+		status: 200,
+		body: { windows: [{ name: "weekly", status: "active", percent: 12 }] },
+	}));
+	const clock = new StepClock();
+	const cache = createUsageCache();
+
+	await collectUsageReports(TARGETS, 0, fetchApi, undefined, { cache, now: clock.now });
+	const rotated: UsageLookupTarget[] = [
+		{ keyIndex: 0, keyName: "opencode-mrr", bearerToken: "token-mrr-rotated" },
+		RR_TARGET,
+	];
+	const second = await collectUsageReports(rotated, 0, fetchApi, undefined, { cache, now: clock.now });
+
+	assert.deepEqual(requests.map((request) => request.authorization), [
+		"Bearer token-mrr",
+		"Bearer token-rr",
+		"Bearer token-mrr-rotated",
+	]);
+	assert.equal(second[0]?.ageSec, undefined);
+	assert.equal(second[1]?.ageSec, 0);
+});
+
+test("createUsageCache keeps an entry until its TTL and ignores it after that", () => {
+	const cache = createUsageCache();
+	const result = okUsage("opencode-mrr", []);
+	cache.set("slot", { result, storedAt: 0 });
+
+	assert.deepEqual(cache.get("slot", USAGE_CACHE_TTL_MS - 1)?.result, result);
+	assert.deepEqual(cache.get("slot", 0), { result, storedAt: 0 });
+	assert.equal(cache.get("slot", USAGE_CACHE_TTL_MS), undefined);
+	assert.equal(cache.get("missing", 0), undefined);
+});
+
+test("formatUsageReport labels its header with the age of the oldest reused reading", () => {
+	const reports: KeyUsageReport[] = [
+		{ keyIndex: 0, keyName: "opencode-mrr", active: true, ageSec: 42, result: okUsage("opencode-mrr", [MRR_5_HOUR]) },
+		{ keyIndex: 1, keyName: "opencode-rr", active: false, ageSec: 7, result: okUsage("opencode-rr", [RR_5_HOUR]) },
+	];
+
+	assert.equal(
+		formatUsageReport(reports).split("\n")[0],
+		"OpenCode Go usage · 2 keys · active: 1 opencode-mrr · cached 42s ago",
+	);
+});
+
+test("formatUsageReport labels nothing when every reading is fresh", () => {
+	const reports: KeyUsageReport[] = [
+		{ keyIndex: 0, keyName: "opencode-mrr", active: true, result: okUsage("opencode-mrr", [MRR_5_HOUR]) },
+		{ keyIndex: 1, keyName: "opencode-rr", active: false, result: okUsage("opencode-rr", [RR_5_HOUR]) },
+	];
+
+	assert.equal(
+		formatUsageReport(reports).split("\n")[0],
+		"OpenCode Go usage · 2 keys · active: 1 opencode-mrr",
+	);
 });

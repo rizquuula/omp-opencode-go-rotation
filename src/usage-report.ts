@@ -1,10 +1,13 @@
 /**
  * Usage reporting for the OpenCode Go keys: parsing the usage endpoint payload, fetching it
- * per key, and rendering the multi-key `/opencode usage` and `/opencode quota` reports.
+ * per key, reusing recent readings, and rendering the multi-key `/opencode usage` and
+ * `/opencode quota` reports.
  *
  * This module must stay free of host imports so it can be unit tested without the extension
  * runtime.
  */
+
+import { createHash } from "node:crypto";
 
 const NO_KEYS_MESSAGE = "No keys configured. Use /opencode add <name> <key>.";
 const OPENCODE_GO_USAGE_URL = "https://opencode.ai/zen/go/v1/usage";
@@ -231,6 +234,8 @@ export interface KeyUsageReport {
 	readonly active: boolean;
 	readonly stateTag?: string;
 	readonly result: UsageFetchResult;
+	/** Whole seconds since the reading was fetched, present only when it came from the cache. */
+	readonly ageSec?: number;
 }
 
 type Column = readonly [value: string, width: number];
@@ -278,7 +283,9 @@ export function formatUsageReport(reports: readonly KeyUsageReport[]): string {
 	if (reports.length === 0) return NO_KEYS_MESSAGE;
 	const active = reports.find((report) => report.active);
 	const activeLabel = active === undefined ? "" : ` · active: ${active.keyIndex + 1} ${active.keyName}`;
-	const lines = [`OpenCode Go usage · ${reports.length} keys${activeLabel}`];
+	const ages = reports.flatMap((report) => report.ageSec === undefined ? [] : [report.ageSec]);
+	const cachedLabel = ages.length === 0 ? "" : ` · cached ${Math.max(...ages)}s ago`;
+	const lines = [`OpenCode Go usage · ${reports.length} keys${activeLabel}${cachedLabel}`];
 	for (const report of reports) {
 		const tag = report.stateTag === undefined ? "" : `  [${report.stateTag}]`;
 		lines.push(formatKeyHeader(report.keyIndex + 1, report.keyName, report.active) + tag);
@@ -295,6 +302,8 @@ export interface QuotaKeyState {
 	readonly blockedForSec?: number;
 	readonly coolingForSec?: number;
 	readonly rateLimitedWindows: readonly string[];
+	/** Whole seconds since the usage reading behind this state was fetched, when it came from the cache. */
+	readonly ageSec?: number;
 }
 
 export function formatQuotaReport(states: readonly QuotaKeyState[]): string {
@@ -325,23 +334,202 @@ export function formatQuotaReport(states: readonly QuotaKeyState[]): string {
 	return lines.join("\n");
 }
 
+/** One key of the `/opencode usage --json` payload. Carries no key material. */
+export interface UsagePayloadKey {
+	/** 1-based, as the text report numbers keys. */
+	readonly index: number;
+	readonly name: string;
+	readonly active: boolean;
+	readonly state?: string;
+	readonly windows?: OpenCodeGoUsageWindow[];
+	readonly message?: string;
+	readonly ageSec?: number;
+}
+
+export interface UsagePayload {
+	readonly provider: "opencode-go";
+	readonly keys: UsagePayloadKey[];
+}
+
+export function toUsagePayload(reports: readonly KeyUsageReport[]): UsagePayload {
+	return {
+		provider: "opencode-go",
+		keys: reports.map((report) => ({
+			index: report.keyIndex + 1,
+			name: report.keyName,
+			active: report.active,
+			...(report.stateTag === undefined ? {} : { state: report.stateTag }),
+			...(report.result.ok ? { windows: report.result.usage.windows } : { message: report.result.message }),
+			...(report.ageSec === undefined ? {} : { ageSec: report.ageSec }),
+		})),
+	};
+}
+
+/** One key of the `/opencode quota --json` payload. Carries no key material. */
+export interface QuotaPayloadKey {
+	/** 1-based, as the text report numbers keys. */
+	readonly index: number;
+	readonly name: string;
+	readonly active: boolean;
+	readonly state: "available" | "quota-blocked" | "cooldown";
+	readonly blockedForSec?: number;
+	readonly coolingForSec?: number;
+	readonly rateLimitedWindows: readonly string[];
+	readonly ageSec?: number;
+}
+
+export interface QuotaPayload {
+	readonly provider: "opencode-go";
+	readonly keys: QuotaPayloadKey[];
+	readonly earliestResetSec?: number;
+	readonly earliestResetKey?: string;
+}
+
+export function toQuotaPayload(states: readonly QuotaKeyState[]): QuotaPayload {
+	let earliestResetSec: number | undefined;
+	let earliestResetKey: string | undefined;
+	for (const state of states) {
+		if (state.blockedForSec === undefined) continue;
+		if (earliestResetSec === undefined || state.blockedForSec < earliestResetSec) {
+			earliestResetSec = state.blockedForSec;
+			earliestResetKey = state.keyName;
+		}
+	}
+	return {
+		provider: "opencode-go",
+		keys: states.map((state) => ({
+			index: state.keyIndex + 1,
+			name: state.keyName,
+			active: state.active,
+			state: state.blockedForSec !== undefined
+				? "quota-blocked"
+				: state.coolingForSec === undefined ? "available" : "cooldown",
+			...(state.blockedForSec === undefined ? {} : { blockedForSec: state.blockedForSec }),
+			...(state.coolingForSec === undefined ? {} : { coolingForSec: state.coolingForSec }),
+			rateLimitedWindows: state.rateLimitedWindows,
+			...(state.ageSec === undefined ? {} : { ageSec: state.ageSec }),
+		})),
+		...(earliestResetSec === undefined ? {} : { earliestResetSec, earliestResetKey }),
+	};
+}
+
+/**
+ * How long a collected reading is reused before a command fetches a fresh one.
+ * `/opencode usage` and `/opencode quota` share one cache, so a pair of commands
+ * inside this window fetches each key once.
+ */
+export const USAGE_CACHE_TTL_MS = 60_000;
+
+/** One reading kept for reuse: the fetch result and the clock reading it was stored at. */
+export interface CachedUsage {
+	readonly result: UsageFetchResult;
+	readonly storedAt: number;
+}
+
+/** Readings addressed by {@link usageCacheKey}, each one ignored once it reaches the TTL. */
+export interface UsageCache {
+	get(key: string, now: number): CachedUsage | undefined;
+	set(key: string, entry: CachedUsage): void;
+}
+
+/** A cache that keeps an entry for `ttlMs` from the moment it was stored. */
+export function createUsageCache(ttlMs: number = USAGE_CACHE_TTL_MS): UsageCache {
+	const entries = new Map<string, CachedUsage>();
+	return {
+		get: (key, now) => {
+			const entry = entries.get(key);
+			if (entry === undefined) return undefined;
+			if (now - entry.storedAt >= ttlMs) {
+				entries.delete(key);
+				return undefined;
+			}
+			return entry;
+		},
+		set: (key, entry) => {
+			entries.set(key, entry);
+		},
+	};
+}
+
+/**
+ * Cache identity of a target: its configured index plus a digest of the bearer. A replaced
+ * bearer at the same index is a different key, and the bearer never reaches the cache key.
+ */
+export function usageCacheKey(target: UsageLookupTarget): string {
+	const digest = createHash("sha256").update(target.bearerToken).digest("hex");
+	return `${target.keyIndex}:${digest.slice(0, 16)}`;
+}
+
+/** Whole seconds between a reading being stored and a later clock reading. */
+export function usageAgeSec(storedAt: number, now: number): number {
+	return Math.max(0, Math.floor((now - storedAt) / 1000));
+}
+
+/** One cached reading, without its key identity: all the status summary needs. */
+export interface CachedUsageReading {
+	readonly result: UsageFetchResult;
+	readonly ageSec: number;
+}
+
+/**
+ * The cache-only usage line `/opencode status` shows: the highest-percentage window among the
+ * cached readings, with how old that reading is. Without a usable reading it points at the
+ * command that fetches one.
+ */
+export function formatCachedUsageSummary(readings: readonly CachedUsageReading[]): string {
+	let bestName: string | undefined;
+	let bestPercent = 0;
+	let bestAgeSec = 0;
+	for (const reading of readings) {
+		if (!reading.result.ok) continue;
+		for (const [index, window] of reading.result.usage.windows.entries()) {
+			if (window.usagePercent === undefined) continue;
+			if (bestName !== undefined && window.usagePercent <= bestPercent) continue;
+			bestName = window.name ?? `window ${index + 1}`;
+			bestPercent = window.usagePercent;
+			bestAgeSec = reading.ageSec;
+		}
+	}
+	if (bestName === undefined) return "Usage: no cached reading (run /opencode usage)";
+	return `Usage: ${bestName} ${Math.round(bestPercent)}% used · cached ${bestAgeSec}s ago`;
+}
+
+export interface CollectUsageOptions {
+	/** Reuses recent readings and stores new ones. Without a cache every call fetches. */
+	readonly cache?: UsageCache;
+	/** Clock the reuse window is measured against; defaults to `Date.now`. */
+	readonly now?: () => number;
+	/** Ignores the cache for this pass and refreshes the entries it fetches. */
+	readonly refresh?: boolean;
+}
+
 /**
  * Reads the usage endpoint once per configured key, in parallel and in the given order.
  * Every key gets its own 10 s window, so one silent key cannot delay the others.
+ * A reading already in the cache is reused, and the report then carries its age.
  */
 export async function collectUsageReports(
 	targets: readonly UsageLookupTarget[],
 	activeKeyIndex: number,
 	fetchApi: FetchApi,
 	timers?: TimerApi,
+	options: CollectUsageOptions = {},
 ): Promise<KeyUsageReport[]> {
-	return Promise.all(targets.map(async (target) => {
-		const result = await fetchOpenCodeGoUsage(target, fetchApi, timers);
-		return {
+	const { cache, refresh = false } = options;
+	const readClock = options.now ?? Date.now;
+	return Promise.all(targets.map(async (target): Promise<KeyUsageReport> => {
+		const header = {
 			keyIndex: target.keyIndex,
 			keyName: target.keyName,
 			active: target.keyIndex === activeKeyIndex,
-			result,
 		};
+		const cacheKey = usageCacheKey(target);
+		const cached = refresh ? undefined : cache?.get(cacheKey, readClock());
+		if (cached !== undefined) {
+			return { ...header, result: cached.result, ageSec: usageAgeSec(cached.storedAt, readClock()) };
+		}
+		const result = await fetchOpenCodeGoUsage(target, fetchApi, timers);
+		cache?.set(cacheKey, { result, storedAt: readClock() });
+		return { ...header, result };
 	}));
 }

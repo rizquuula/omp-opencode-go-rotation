@@ -14,7 +14,7 @@ import { join } from "node:path";
 import test from "node:test";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import { createOpencodeGoRotationExtension } from "../src/index.ts";
-import type { FetchApi, FetchResponseApi, OpenCodeGoUsageWindow } from "../src/usage-report.ts";
+import { isRecord, type FetchApi, type FetchResponseApi, type OpenCodeGoUsageWindow } from "../src/usage-report.ts";
 
 const USAGE_URL = "https://opencode.ai/zen/go/v1/usage";
 
@@ -373,18 +373,21 @@ test("/opencode quota warns when every key failed and reads no window from a fai
 	});
 });
 
-test("/opencode status keeps its exact output for a blocked key and a cooling key", async () => {
+test("/opencode status keeps its exact output for a blocked key and a cooling key, without fetching", async () => {
 	await withTempConfig(async () => {
-		const { pi, ctx, state } = createHarness();
+		const { fetch, requests } = recordingFetch(() => OK_ACTIVE);
+		const { pi, ctx, state } = createHarness(fetch);
 
 		await pi.runCommand("opencode", "status", ctx);
 
+		assert.equal(requests.length, 0);
 		assert.equal(latestNotification(state).message, [
 			"→ 1. one [quota-blocked 2h 10m]",
 			"  2. two [cooldown 3m]",
 			"  3. three",
 			"Watchdog: on (90s idle)",
 			"Rotate every: off",
+			"Usage: no cached reading (run /opencode usage)",
 		].join("\n"));
 		assertNoKeyMaterial(state);
 	}, {
@@ -393,4 +396,151 @@ test("/opencode status keeps its exact output for a blocked key and a cooling ke
 		cooldowns: { 1: 0 },
 		quotaBlockedUntil: { 0: 7_800_000 },
 	});
+});
+
+test("/opencode status reports the empty cache before any usage command ran", async () => {
+	await withTempConfig(async () => {
+		const { pi, ctx, state } = createHarness();
+
+		await pi.runCommand("opencode", "status", ctx);
+
+		assert.equal(latestNotification(state).message, [
+			"→ 1. one",
+			"  2. two",
+			"Watchdog: on (90s idle)",
+			"Rotate every: off",
+			"Usage: no cached reading (run /opencode usage)",
+		].join("\n"));
+		assertNoKeyMaterial(state);
+	});
+});
+
+test("/opencode usage and /opencode quota reuse one cache inside the TTL", async () => {
+	await withTempConfig(async () => {
+		const { fetch, requests } = recordingFetch(() => OK_ACTIVE);
+		const { pi, ctx, clock } = createHarness(fetch);
+
+		await pi.runCommand("opencode", "usage", ctx);
+		clock.time = 30_000;
+		await pi.runCommand("opencode", "quota", ctx);
+
+		assert.deepEqual(requests.map((request) => request.authorization), ["Bearer sk-one", "Bearer sk-two"]);
+	});
+});
+
+test("/opencode usage --refresh bypasses the cache and refreshes its entries", async () => {
+	await withTempConfig(async () => {
+		const { fetch, requests } = recordingFetch(() => OK_ACTIVE);
+		const { pi, ctx, state, clock } = createHarness(fetch);
+
+		await pi.runCommand("opencode", "usage", ctx);
+		clock.time = 5_000;
+		await pi.runCommand("opencode", "usage --refresh", ctx);
+
+		assert.equal(requests.length, 4);
+		assert.equal(latestNotification(state).message.includes("cached"), false);
+
+		// The refreshed readings replaced the cached ones, so a plain run inside the TTL fetches nothing.
+		await pi.runCommand("opencode", "usage", ctx);
+
+		assert.equal(requests.length, 4);
+		assert.equal(latestNotification(state).message.includes("· cached 0s ago"), true);
+	});
+});
+
+test("/opencode status shows the highest cached window and how old the reading is", async () => {
+	await withTempConfig(async () => {
+		const { fetch } = recordingFetch((authorization) => authorization === "Bearer sk-two"
+			? { ok: true, status: 200, body: { windows: [{ name: "5-hour", status: "active", usagePercent: 91 }] } }
+			: {
+				ok: true,
+				status: 200,
+				body: {
+					windows: [
+						{ name: "5-hour", status: "active", usagePercent: 70 },
+						{ name: "weekly", status: "active", usagePercent: 4 },
+					],
+				},
+			});
+		const { pi, ctx, state, clock } = createHarness(fetch);
+
+		await pi.runCommand("opencode", "usage", ctx);
+		clock.time = 15_000;
+		await pi.runCommand("opencode", "status", ctx);
+
+		assert.equal(latestNotification(state).message, [
+			"→ 1. one",
+			"  2. two",
+			"Watchdog: on (90s idle)",
+			"Rotate every: off",
+			"Usage: 5-hour 91% used · cached 15s ago",
+		].join("\n"));
+		assertNoKeyMaterial(state);
+	});
+});
+
+/** The notification text parsed as a JSON object, so the payload assertions stay typed. */
+function jsonRecord(message: string): Record<string, unknown> {
+	const parsed: unknown = JSON.parse(message);
+	assert.ok(isRecord(parsed), `expected a JSON object, got: ${message}`);
+	return parsed;
+}
+
+/** A JSON array whose entries are all JSON objects. */
+function jsonRecords(value: unknown): Array<Record<string, unknown>> {
+	assert.ok(Array.isArray(value), `expected a JSON array, got: ${String(value)}`);
+	return value.map((entry) => {
+		assert.ok(isRecord(entry), `expected a JSON object in the array, got: ${String(entry)}`);
+		return entry;
+	});
+}
+
+test("/opencode usage --json notifies one JSON line with every key and no key material", async () => {
+	await withTempConfig(async () => {
+		const { fetch } = recordingFetch((authorization) => authorization === "Bearer sk-two"
+			? { ok: false, status: 500, body: {} }
+			: OK_ACTIVE);
+		const { pi, ctx, state } = createHarness(fetch);
+
+		await pi.runCommand("opencode", "usage --json", ctx);
+
+		const notification = latestNotification(state);
+		assert.equal(notification.message.includes("\n"), false);
+		assert.equal(notification.level, "info");
+		const payload = jsonRecord(notification.message);
+		assert.equal(payload.provider, "opencode-go");
+		const keys = jsonRecords(payload.keys);
+		assert.deepEqual(keys.map((key) => [key.index, key.name, key.active]), [[1, "one", true], [2, "two", false]]);
+		assert.deepEqual(jsonRecords(keys[0]?.windows), [{ name: "weekly", status: "active", usagePercent: 12 }]);
+		assert.equal(keys[1]?.message, "Usage request failed with HTTP 500.");
+		assert.equal("ageSec" in (keys[0] ?? {}), false);
+		assertNoKeyMaterial(state);
+	});
+});
+
+test("/opencode quota --json notifies one JSON line with the earliest reset and the cached age", async () => {
+	await withTempConfig(async () => {
+		const { fetch } = recordingFetch(() => OK_ACTIVE);
+		const { pi, ctx, state, clock } = createHarness(fetch);
+
+		await pi.runCommand("opencode", "usage", ctx);
+		clock.time = 20_000;
+		await pi.runCommand("opencode", "quota --json", ctx);
+
+		const notification = latestNotification(state);
+		assert.equal(notification.message.includes("\n"), false);
+		assert.equal(notification.level, "info");
+		const payload = jsonRecord(notification.message);
+		assert.equal(payload.provider, "opencode-go");
+		const keys = jsonRecords(payload.keys);
+		// Key one is quota-blocked, so the synchronized pass made key two active.
+		assert.deepEqual(keys.map((key) => [key.index, key.name, key.active, key.state, key.ageSec]), [
+			[1, "one", false, "quota-blocked", 20],
+			[2, "two", true, "available", 20],
+		]);
+		// The stored deadline is absolute, so 20 s of the block are already spent.
+		assert.equal(payload.earliestResetSec, 7_780);
+		assert.equal(payload.earliestResetKey, "one");
+		assertNoKeyMaterial(state);
+	}, { quotaBlockedUntil: { 0: 7_800_000 } });
 });

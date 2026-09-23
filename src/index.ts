@@ -10,12 +10,19 @@ import {
 } from "./config-store.ts";
 import {
 	collectUsageReports,
+	createUsageCache,
 	fetchOpenCodeGoUsage,
+	formatCachedUsageSummary,
 	formatQuotaReport,
 	formatResetIn,
 	formatUsageReport,
 	formatUsageStatus,
 	isRecord,
+	toQuotaPayload,
+	toUsagePayload,
+	usageAgeSec,
+	usageCacheKey,
+	type CachedUsageReading,
 	type FetchApi,
 	type KeyUsageReport,
 	type OpenCodeGoUsageResponse,
@@ -592,17 +599,19 @@ function formatKeyStateTag(config: Config, keyIndex: number, currentTime: number
 	return remaining > 0 ? `cooldown ${Math.ceil(remaining / 60_000)}m` : undefined;
 }
 
-function formatStatus(config: Config, now = Date.now()): string {
+function formatStatus(config: Config, now = Date.now(), usageSummary?: string): string {
 	const watchdogStatus = `Watchdog: ${config.watchdogEnabled ? "on" : "off"} (${Math.ceil(getWatchdogIdleMs(config) / 1000)}s idle)`;
 	const cadenceStatus = `Rotate every: ${config.rotateEveryRequests > 0 ? `${config.rotateEveryRequests} requests` : "off"}`;
 	if (config.keys.length === 0) {
 		return `No keys configured. Use /opencode add <name> <key>.\n${watchdogStatus}\n${cadenceStatus}`;
 	}
-	return `${config.keys.map((key, i) => {
+	const keyStatus = config.keys.map((key, i) => {
 		const marker = i === config.activeKeyIndex ? "→" : " ";
 		const stateTag = formatKeyStateTag(config, i, now);
 		return `${marker} ${i + 1}. ${key.name}${stateTag === undefined ? "" : ` [${stateTag}]`}`;
-	}).join("\n")}\n${watchdogStatus}\n${cadenceStatus}`;
+	}).join("\n");
+	const usageStatus = usageSummary === undefined ? "" : `\n${usageSummary}`;
+	return `${keyStatus}\n${watchdogStatus}\n${cadenceStatus}${usageStatus}`;
 }
 
 /**
@@ -625,6 +634,7 @@ function toQuotaKeyState(config: Config, report: KeyUsageReport, currentTime: nu
 			? report.result.usage.windows.flatMap((window, index) =>
 				window.status === "rate-limited" ? [window.name ?? `window ${index + 1}`] : [])
 			: [],
+		...(report.ageSec === undefined ? {} : { ageSec: report.ageSec }),
 	};
 }
 
@@ -690,6 +700,8 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 
 		const now = (): number => options.clock?.now() ?? Date.now();
 		const fetchApi: FetchApi = options.fetch ?? globalThis.fetch.bind(globalThis);
+		/** Readings the usage commands reuse for 60 s; the reactive 429 and watchdog paths never read it. */
+		const usageCache = createUsageCache();
 
 		function formatConfigError(error: unknown): string {
 			if (error instanceof ConfigLoadError) return error.message;
@@ -1296,15 +1308,23 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 		/**
 		 * One usage pass over every configured key: synchronize the active key first, query each
 		 * key with its own bearer, then stamp each reading with the restriction that key carries.
+		 * Readings from the last 60 s are reused unless the caller asks for a refresh.
 		 */
-		async function collectConfiguredKeyReports(ctx: Pick<ExtensionContext, "modelRegistry">): Promise<ConfiguredKeyReports> {
+		async function collectConfiguredKeyReports(
+			ctx: Pick<ExtensionContext, "modelRegistry">,
+			collectOptions: { readonly refresh?: boolean } = {},
+		): Promise<ConfiguredKeyReports> {
 			applySynchronizedActiveKey(ctx);
 			const targets: UsageLookupTarget[] = [];
 			for (let keyIndex = 0; keyIndex < config.keys.length; keyIndex++) {
 				const target = getUsageTargetForKeyIndex(config, keyIndex);
 				if (target) targets.push(target);
 			}
-			const reports = await collectUsageReports(targets, config.activeKeyIndex, fetchApi, options.timers);
+			const reports = await collectUsageReports(targets, config.activeKeyIndex, fetchApi, options.timers, {
+				cache: usageCache,
+				now,
+				refresh: collectOptions.refresh ?? false,
+			});
 			const currentTime = now();
 			return {
 				currentTime,
@@ -1313,6 +1333,18 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 					return stateTag === undefined ? report : { ...report, stateTag };
 				}),
 			};
+		}
+
+		/** What the cache holds right now, without fetching anything. */
+		function readCachedUsageReadings(currentTime: number): CachedUsageReading[] {
+			const readings: CachedUsageReading[] = [];
+			for (let keyIndex = 0; keyIndex < config.keys.length; keyIndex++) {
+				const target = getUsageTargetForKeyIndex(config, keyIndex);
+				const entry = target === undefined ? undefined : usageCache.get(usageCacheKey(target), currentTime);
+				if (entry === undefined) continue;
+				readings.push({ result: entry.result, ageSec: usageAgeSec(entry.storedAt, currentTime) });
+			}
+			return readings;
 		}
 
 		pi.registerCommand("opencode", {
@@ -1327,8 +1359,9 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 					case "status":
 					case "list":
 					case "ls": {
-						const status = formatStatus(config, now());
-						ctx.ui.notify(status, "info");
+						const currentTime = now();
+						const usageSummary = formatCachedUsageSummary(readCachedUsageReadings(currentTime));
+						ctx.ui.notify(formatStatus(config, currentTime, usageSummary), "info");
 						break;
 					}
 
@@ -1367,15 +1400,19 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 					}
 
 					case "usage": {
-						const { reports } = await collectConfiguredKeyReports(ctx);
-						ctx.ui.notify(formatUsageReport(reports), reports.some((report) => report.result.ok) ? "info" : "warning");
+						const { reports } = await collectConfiguredKeyReports(ctx, { refresh: parts.includes("--refresh") });
+						const level = reports.some((report) => report.result.ok) ? "info" : "warning";
+						const report = parts.includes("--json") ? JSON.stringify(toUsagePayload(reports)) : formatUsageReport(reports);
+						ctx.ui.notify(report, level);
 						break;
 					}
 
 					case "quota": {
-						const { currentTime, reports } = await collectConfiguredKeyReports(ctx);
+						const { currentTime, reports } = await collectConfiguredKeyReports(ctx, { refresh: parts.includes("--refresh") });
 						const states = reports.map((report) => toQuotaKeyState(config, report, currentTime));
-						ctx.ui.notify(formatQuotaReport(states), reports.some((report) => report.result.ok) ? "info" : "warning");
+						const level = reports.some((report) => report.result.ok) ? "info" : "warning";
+						const report = parts.includes("--json") ? JSON.stringify(toQuotaPayload(states)) : formatQuotaReport(states);
+						ctx.ui.notify(report, level);
 						break;
 					}
 
@@ -1557,7 +1594,7 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 
 					default:
 						ctx.ui.notify(
-							"Usage: /opencode [status|usage|quota|events|use <n>|next|add <name> <key>|rm <n>|reset|cooldown <min>|rotate-every <n|off>|watchdog [status|on|off|<seconds>]]",
+							"Usage: /opencode [status|usage|quota [--refresh|--json]|events|use <n>|next|add <name> <key>|rm <n>|reset|cooldown <min>|rotate-every <n|off>|watchdog [status|on|off|<seconds>]]",
 							"info",
 						);
 				}

@@ -62,13 +62,39 @@ Keys that are quota-blocked or cooling down are skipped. Manual `/opencode use <
 
 Both usage commands read every configured key. They use `https://opencode.ai/zen/go/v1/usage` and stop waiting after 10 seconds for each key.
 
+### Usage readings
+
+Both usage commands reuse each reading for 60 seconds. When the two commands run inside that window, each key is fetched once. The header of a reused report shows the age of the oldest reading:
+
+```
+OpenCode Go usage · 2 keys · active: 1 personal · cached 42s ago
+```
+
+Add `--refresh` to both commands to ignore the cached readings. The commands fetch every key again, and the new readings replace the cached ones.
+
+Add `--json` to both commands to get one JSON line instead of the table. The payload holds the provider, every key with its state, and no key material.
+
+`/opencode status` shows a usage line that reads the cache only. It never fetches. The line names the window with the highest usage:
+
+```
+Usage: 5-hour 91% used · cached 15s ago
+```
+
+Before any usage command has run, the cache is empty, and the line says:
+
+```
+Usage: no cached reading (run /opencode usage)
+```
+
+The reactive paths do not use the cache. A 429 or a stalled request always fetches the current usage.
+
 ## Commands
 
 | Command | Description |
 |---------|-------------|
-| `/opencode` or `/opencode status` | Show all keys, the active key marker, cooldown and quota-blocked status, watchdog state, and cadence |
-| `/opencode usage` | Fetch OpenCode Go usage for every configured key, with the active key marked, and no key material |
-| `/opencode quota` | Show the quota state of every configured key, its rate-limited windows, and the earliest quota reset |
+| `/opencode` or `/opencode status` | Show all keys, the active key marker, cooldown and quota-blocked status, watchdog state, cadence, and the cached usage line |
+| `/opencode usage [--refresh] [--json]` | Fetch OpenCode Go usage for every configured key, with the active key marked, and no key material. Reuses readings for 60 seconds |
+| `/opencode quota [--refresh] [--json]` | Show the quota state of every configured key, its rate-limited windows, and the earliest quota reset. Reuses readings for 60 seconds |
 | `/opencode use <n>` | Switch to key number `n` (1-based) and clear its cooldown and quota block |
 | `/opencode next` | Advance to the next configured key and clear its cooldown and quota block before activating it |
 | `/opencode add <name> <key>` | Add a new key |
