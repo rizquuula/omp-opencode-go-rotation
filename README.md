@@ -21,6 +21,18 @@ omp plugin link ~/Playground/omp-opencode-go-rotation
 
 `dist/` is committed, so the linked or installed package runs without a build step.
 
+## Update
+
+omp pins a git install to the resolved commit. Install an explicit tag to move to a newer release:
+
+```bash
+omp plugin install github:rizquuula/omp-opencode-go-rotation#v1.7.0
+```
+
+Restart omp sessions after an update.
+
+For a linked clone, run `git pull` and `bun run build`, then restart omp.
+
 ## Setup
 
 Add your API keys:
