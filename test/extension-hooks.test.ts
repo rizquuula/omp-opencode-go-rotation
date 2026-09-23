@@ -1,6 +1,24 @@
-import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
-import type { AnthropicOptions, Context, Usage } from "@mariozechner/pi-ai";
-import { getModel, streamAnthropic } from "@mariozechner/pi-ai";
+/**
+ * Reactive-behaviour suite for the rotation extension: 429 rotation, quota blocks, watchdog
+ * abort, key reindexing, and reasoning-payload sanitising.
+ *
+ * Ported from the upstream runtime. Four deliberate divergences, so the next upstream merge is
+ * reviewable:
+ *   1. Imports come from `@oh-my-pi/pi-coding-agent` and `@oh-my-pi/pi-ai`. omp exports no
+ *      `getModel`, so the Anthropic catalog entry is the local `ANTHROPIC_MODEL` fixture.
+ *   2. omp's `session_start` carries no `reason`, so every start emits `{ type: "session_start" }`.
+ *      A start invalidates pending automatic decisions, which is the behaviour the
+ *      "invalidates a pending quota decision" test relies on instead of a reload-specific branch.
+ *   3. omp ignores `message_end` handler results, so the watchdog and rotation assertions read
+ *      the observable effects (runtime key, notification, persisted cooldown, abort count)
+ *      instead of a rewritten message that no longer exists.
+ *   4. `/opencode usage` queries every configured key with its own bearer and reports them
+ *      together, so the usage assertions cover the whole key set.
+ */
+
+import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
+import type { AnthropicOptions, Context, Model, Usage } from "@oh-my-pi/pi-ai";
+import { streamAnthropic } from "@oh-my-pi/pi-ai";
 import type { FetchApi, OpenCodeGoUsageWindow } from "../src/index.ts";
 import { updateConfig, type Config } from "../src/config-store.ts";
 import { chmodSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
@@ -44,6 +62,11 @@ class FakeTimers {
 			delete this.timers[Number(id)];
 			entry.callback();
 		}
+	}
+
+	/** Every pending timer's delay, in registration order. */
+	get delays(): number[] {
+		return Object.values(this.timers).map((entry) => entry.ms);
 	}
 }
 
@@ -239,17 +262,17 @@ test("session start supports the current model registry runtime store", async ()
 	await withTempConfig(async () => {
 		const { pi, ctx, state } = createHarness("runtime");
 
-		await pi.emit("session_start", { reason: "start" }, ctx);
+		await pi.emit("session_start", { type: "session_start" }, ctx);
 
 		assert.equal(state.runtimeKeys.at(-1), "sk-one");
 	});
 });
 
-test("runtime registry supports resume, reload, and final-key removal", async () => {
+test("runtime registry supports repeated session starts and final-key removal", async () => {
 	await withTempConfig(async () => {
 		const { pi, ctx, state } = createHarness("runtime");
-		await pi.emit("session_start", { reason: "resume" }, ctx);
-		await pi.emit("session_start", { reason: "reload" }, ctx);
+		await pi.emit("session_start", { type: "session_start" }, ctx);
+		await pi.emit("session_start", { type: "session_start" }, ctx);
 		assert.deepEqual(state.runtimeKeys, ["sk-one", "sk-one"]);
 		await pi.runCommand("opencode", "remove 3", ctx);
 		await pi.runCommand("opencode", "remove 2", ctx);
@@ -259,21 +282,23 @@ test("runtime registry supports resume, reload, and final-key removal", async ()
 });
 
 test("hook replay aborts a no-response hang and rotates", async () => {
-	await withTempConfig(async () => {
+	await withTempConfig(async (configPath) => {
 		const { pi, ctx, state, timers, clock } = createHarness();
 
-		await pi.emit("session_start", { reason: "start" }, ctx);
+		await pi.emit("session_start", { type: "session_start" }, ctx);
 		await pi.emit("before_provider_request", {}, ctx);
 		clock.advance(90_000);
 		timers.fireAll();
-		const result = await pi.emit("message_end", {
+		// omp ignores this result; the watchdog already aborted and rotated in its timer.
+		await pi.emit("message_end", {
 			message: { role: "assistant", provider: "opencode-go", stopReason: "abort", errorMessage: "" },
 		}, ctx);
 
 		assert.equal(state.aborts, 1);
-		assert.deepEqual(state.runtimeKeys.at(-1), "sk-two");
-		assert.match(JSON.stringify(result), /waiting for response stalled/);
-		assert.match(JSON.stringify(result), /rotated to two/);
+		assert.deepEqual(state.runtimeKeys, ["sk-one", "sk-two"]);
+		assert.deepEqual(readConfig(configPath).cooldowns, { "0": 90_000 });
+		assert.match(state.notifications.join("\n"), /waiting for response stalled/);
+		assert.match(state.notifications.join("\n"), /rotated to two/);
 	});
 });
 
@@ -281,7 +306,7 @@ test("late 429 after a watchdog rotation does not rotate a second key", async ()
 	await withTempConfig(async () => {
 		const { pi, ctx, state, timers, clock } = createHarness();
 
-		await pi.emit("session_start", { reason: "start" }, ctx);
+		await pi.emit("session_start", { type: "session_start" }, ctx);
 		await pi.emit("before_provider_request", {}, ctx);
 		clock.advance(90_000);
 		timers.fireAll();
@@ -298,7 +323,7 @@ test("disabling the watchdog clears a stale timeout guard", async () => {
 	await withTempConfig(async () => {
 		const { pi, ctx, state, timers, clock } = createHarness();
 
-		await pi.emit("session_start", { reason: "start" }, ctx);
+		await pi.emit("session_start", { type: "session_start" }, ctx);
 		await pi.emit("before_provider_request", {}, ctx);
 		clock.advance(90_000);
 		timers.fireAll();
@@ -314,32 +339,34 @@ test("disabling the watchdog clears a stale timeout guard", async () => {
 });
 
 test("hook replay reuses the 429-rotated key when the 429 body hangs", async () => {
-	await withTempConfig(async () => {
+	await withTempConfig(async (configPath) => {
 		const { pi, ctx, state, timers, clock } = createHarness();
 
-		await pi.emit("session_start", { reason: "start" }, ctx);
+		await pi.emit("session_start", { type: "session_start" }, ctx);
 		await pi.emit("before_provider_request", {}, ctx);
 		await pi.emit("after_provider_response", { status: 429 }, ctx);
 		clock.advance(90_000);
 		timers.fireAll();
-		const result = await pi.emit("message_end", {
+		await pi.emit("message_end", {
 			message: { role: "assistant", provider: "opencode-go", stopReason: "abort", errorMessage: "" },
 		}, ctx);
 		await pi.runCommand("opencode", "events", ctx);
 
 		assert.equal(state.aborts, 1);
-		assert.deepEqual(state.runtimeKeys.at(-1), "sk-two");
-		assert.match(JSON.stringify(result), /last HTTP 429/);
-		assert.match(JSON.stringify(result), /using two/);
+		// Exactly one rotation: the watchdog reused the key the 429 had already selected.
+		assert.deepEqual(state.runtimeKeys, ["sk-one", "sk-two"]);
+		assert.deepEqual(readConfig(configPath).cooldowns, { "0": 0 });
+		assert.match(state.notifications.join("\n"), /last HTTP 429/);
+		assert.match(state.notifications.join("\n"), /using two/);
 		assert.match(state.notifications.join("\n"), /using=two/);
 	});
 });
 
 test("hook replay keeps the rapid-retry rotation when the second 429 hangs", async () => {
-	await withTempConfig(async () => {
+	await withTempConfig(async (configPath) => {
 		const { pi, ctx, state, timers, clock } = createHarness();
 
-		await pi.emit("session_start", { reason: "start" }, ctx);
+		await pi.emit("session_start", { type: "session_start" }, ctx);
 		await pi.emit("before_provider_request", {}, ctx);
 		await pi.emit("message_end", {
 			message: { role: "assistant", provider: "opencode-go", stopReason: "error", errorMessage: "429 rate limit" },
@@ -350,14 +377,16 @@ test("hook replay keeps the rapid-retry rotation when the second 429 hangs", asy
 		await pi.emit("after_provider_response", { status: 429 }, ctx);
 		clock.advance(90_000);
 		timers.fireAll();
-		const result = await pi.emit("message_end", {
+		await pi.emit("message_end", {
 			message: { role: "assistant", provider: "opencode-go", stopReason: "abort", errorMessage: "" },
 		}, ctx);
 
 		assert.equal(state.aborts, 1);
-		assert.deepEqual(state.runtimeKeys.at(-1), "sk-three");
-		assert.match(JSON.stringify(result), /last HTTP 429/);
-		assert.match(JSON.stringify(result), /using three/);
+		// The second 429 rotated to three; the watchdog reused it instead of rotating again.
+		assert.deepEqual(state.runtimeKeys, ["sk-one", "sk-two", "sk-three"]);
+		assert.deepEqual(readConfig(configPath).cooldowns, { "0": 0, "1": 0 });
+		assert.match(state.notifications.join("\n"), /last HTTP 429/);
+		assert.match(state.notifications.join("\n"), /using three/);
 	});
 });
 
@@ -365,7 +394,7 @@ test("a rapid retry can rotate again in a new request", async () => {
 	await withTempConfig(async () => {
 		const { pi, ctx, state } = createHarness();
 
-		await pi.emit("session_start", { reason: "start" }, ctx);
+		await pi.emit("session_start", { type: "session_start" }, ctx);
 		await pi.emit("before_provider_request", {}, ctx);
 		await pi.emit("after_provider_response", { status: 429 }, ctx);
 		assert.equal(state.runtimeKeys.at(-1), "sk-two");
@@ -382,7 +411,7 @@ test("fixed-window quota errors block the failed key and rotate automatically", 
 		const { pi, ctx, state } = createHarness();
 		const quotaError = "You have exceeded the 5-hour usage quota. It will reset at 2026-08-01T12:00:00Z";
 
-		await pi.emit("session_start", { reason: "start" }, ctx);
+		await pi.emit("session_start", { type: "session_start" }, ctx);
 		await pi.emit("before_provider_request", {}, ctx);
 		await pi.emit("message_end", {
 			message: { role: "assistant", provider: "opencode-go", stopReason: "error", errorMessage: quotaError },
@@ -396,7 +425,7 @@ test("fixed-window quota errors fall back to the cooldown when no reset is parse
 	await withTempConfig(async (configPath) => {
 		const { pi, ctx, state } = createHarness();
 
-		await pi.emit("session_start", { reason: "start" }, ctx);
+		await pi.emit("session_start", { type: "session_start" }, ctx);
 		await pi.emit("before_provider_request", {}, ctx);
 		await pi.emit("message_end", {
 			message: {
@@ -421,7 +450,7 @@ test("response quota rotation and message_end cannot rotate twice", async () => 
 		});
 		const { pi, ctx, state } = createHarness("authStorage", fetch);
 
-		await pi.emit("session_start", { reason: "start" }, ctx);
+		await pi.emit("session_start", { type: "session_start" }, ctx);
 		await pi.emit("before_provider_request", {}, ctx);
 		await pi.emit("after_provider_response", { status: 429 }, ctx);
 		await pi.emit("message_end", {
@@ -443,7 +472,7 @@ test("one transient 429 request cannot rotate twice after the old dedup window",
 		const fetch: FetchApi = async () => ({ ok: false, status: 503, json: async () => ({}) });
 		const { pi, ctx, state, clock } = createHarness("authStorage", fetch);
 
-		await pi.emit("session_start", { reason: "start" }, ctx);
+		await pi.emit("session_start", { type: "session_start" }, ctx);
 		await pi.emit("before_provider_request", {}, ctx);
 		await pi.emit("after_provider_response", { status: 429 }, ctx);
 		clock.advance(6_000);
@@ -461,7 +490,7 @@ test("a fixed-window message upgrades a transient response rotation without rota
 		const { pi, ctx, state } = createHarness("authStorage", fetch);
 		const reset = Date.parse("2026-08-01T12:00:00Z");
 
-		await pi.emit("session_start", { reason: "start" }, ctx);
+		await pi.emit("session_start", { type: "session_start" }, ctx);
 		await pi.emit("before_provider_request", {}, ctx);
 		await pi.emit("after_provider_response", { status: 429 }, ctx);
 		await pi.emit("message_end", {
@@ -487,7 +516,7 @@ test("an authoritative message reset replaces a longer usage fallback", async ()
 		});
 		const { pi, ctx } = createHarness("authStorage", fetch);
 
-		await pi.emit("session_start", { reason: "start" }, ctx);
+		await pi.emit("session_start", { type: "session_start" }, ctx);
 		await pi.emit("before_provider_request", {}, ctx);
 		await pi.emit("after_provider_response", { status: 429 }, ctx);
 		assert.equal(readConfig(configPath).quotaBlockedUntil?.["0"], 3_600_000);
@@ -509,7 +538,7 @@ test("an unmatched 429 response cannot rotate after another provider request sta
 	await withTempConfig(async (configPath) => {
 		const { pi, ctx, state } = createHarness();
 
-		await pi.emit("session_start", { reason: "start" }, ctx);
+		await pi.emit("session_start", { type: "session_start" }, ctx);
 		await pi.emit("before_provider_request", {}, ctx);
 		Object.assign(ctx, { model: { provider: "deepseek", baseUrl: "https://api.deepseek.com" } });
 		await pi.emit("before_provider_request", {}, ctx);
@@ -530,7 +559,7 @@ test("sequential quota failures try each key once and then stop", async () => {
 		});
 		const { pi, ctx, state } = createHarness("authStorage", fetch);
 
-		await pi.emit("session_start", { reason: "start" }, ctx);
+		await pi.emit("session_start", { type: "session_start" }, ctx);
 		for (const expectedKey of ["sk-two", "sk-three", "sk-three"]) {
 			await pi.emit("before_provider_request", {}, ctx);
 			await pi.emit("after_provider_response", { status: 429 }, ctx);
@@ -565,7 +594,7 @@ test("transient all-cooldown fallback skips active quota blocks", async () => {
 		}), { mode: 0o600 });
 		const { pi, ctx, state } = createHarness();
 
-		await pi.emit("session_start", { reason: "start" }, ctx);
+		await pi.emit("session_start", { type: "session_start" }, ctx);
 		await pi.emit("before_provider_request", {}, ctx);
 		await pi.emit("message_end", {
 			message: { role: "assistant", provider: "opencode-go", stopReason: "error", errorMessage: "429 rate limit" },
@@ -590,7 +619,7 @@ test("quota exhaustion falls back to a cooling key instead of keeping the blocke
 		});
 		const { pi, ctx, state } = createHarness("authStorage", fetch);
 
-		await pi.emit("session_start", { reason: "start" }, ctx);
+		await pi.emit("session_start", { type: "session_start" }, ctx);
 		await pi.emit("before_provider_request", {}, ctx);
 		await pi.emit("after_provider_response", { status: 429 }, ctx);
 
@@ -600,7 +629,7 @@ test("quota exhaustion falls back to a cooling key instead of keeping the blocke
 	});
 });
 
-test("usage command fetches active key usage without exposing key material", async () => {
+test("usage command fetches every configured key with its own bearer", async () => {
 	await withTempConfig(async () => {
 		const calls: Array<{ url: string; authorization?: string }> = [];
 		const fetch: FetchApi = async (url, init) => {
@@ -620,33 +649,51 @@ test("usage command fetches active key usage without exposing key material", asy
 
 		await pi.runCommand("opencode", "usage", ctx);
 
-		assert.deepEqual(calls, [{ url: "https://opencode.ai/zen/go/v1/usage", authorization: "Bearer sk-one" }]);
+		assert.deepEqual(calls, [
+			{ url: "https://opencode.ai/zen/go/v1/usage", authorization: "Bearer sk-one" },
+			{ url: "https://opencode.ai/zen/go/v1/usage", authorization: "Bearer sk-two" },
+			{ url: "https://opencode.ai/zen/go/v1/usage", authorization: "Bearer sk-three" },
+		]);
 		const notification = state.notifications.at(-1) ?? "";
-		assert.match(notification, /OpenCode usage for one/);
-		assert.match(notification, /5-hour: active; 70% used; 8\.4\/12 used; 3\.6 remaining; resets in 2h 15m/);
-		assert.doesNotMatch(notification, /sk-one/);
+		assert.equal(notification, [
+			"OpenCode Go usage · 3 keys · active: 1 one",
+			"→ 1. one",
+			"     5-hour   active        70% used  8.4/12 used  3.6 left  reset in 2h 15m",
+			"  2. two",
+			"     5-hour   active        70% used  8.4/12 used  3.6 left  reset in 2h 15m",
+			"  3. three",
+			"     5-hour   active        70% used  8.4/12 used  3.6 left  reset in 2h 15m",
+		].join("\n"));
+		assert.doesNotMatch(notification, /sk-one|sk-two|sk-three/);
 	});
 });
 
-test("usage command times out and aborts an unresponsive usage request", async () => {
+test("usage command times out and aborts every unresponsive key request", async () => {
 	await withTempConfig(async () => {
-		let usageSignal: AbortSignal | undefined;
+		const signals: AbortSignal[] = [];
 		const fetch: FetchApi = async (_url, init) => {
-			usageSignal = init.signal;
+			if (init.signal) signals.push(init.signal);
 			return await new Promise(() => {});
 		};
 		const { pi, ctx, state, timers } = createHarness("authStorage", fetch);
 
 		const command = pi.runCommand("opencode", "usage", ctx);
+		// One 10 s window per configured key, all running in parallel.
+		assert.deepEqual(timers.delays, [10_000, 10_000, 10_000]);
 		timers.fireByDelay(10_000);
-		const completed = await Promise.race([
-			command.then(() => true),
-			new Promise<false>((resolve) => globalThis.setTimeout(() => resolve(false), 25)),
-		]);
+		// The command must settle on the fired timeouts; awaiting it is the proof.
+		await command;
 
-		assert.equal(completed, true);
-		assert.equal(usageSignal?.aborted, true);
-		assert.match(state.notifications.at(-1) ?? "", /timed out after 10s/);
+		assert.deepEqual(signals.map((signal) => signal.aborted), [true, true, true]);
+		assert.equal(state.notifications.at(-1), [
+			"OpenCode Go usage · 3 keys · active: 1 one",
+			"→ 1. one",
+			"     unavailable: Usage request timed out after 10s.",
+			"  2. two",
+			"     unavailable: Usage request timed out after 10s.",
+			"  3. three",
+			"     unavailable: Usage request timed out after 10s.",
+		].join("\n"));
 	});
 });
 
@@ -673,7 +720,7 @@ test("removing the fetched key invalidates a late quota result for its replaceme
 		});
 		const { pi, ctx, state } = createHarness("authStorage", fetch);
 
-		await pi.emit("session_start", { reason: "start" }, ctx);
+		await pi.emit("session_start", { type: "session_start" }, ctx);
 		await pi.emit("before_provider_request", {}, ctx);
 		const responseHook = pi.emit("after_provider_response", { status: 429 }, ctx);
 		await pi.runCommand("opencode", "rm 1", ctx);
@@ -701,7 +748,7 @@ test("a new request invalidates a late quota result for the same key", async () 
 		});
 		const { pi, ctx, state } = createHarness("authStorage", fetch);
 
-		await pi.emit("session_start", { reason: "start" }, ctx);
+		await pi.emit("session_start", { type: "session_start" }, ctx);
 		await pi.emit("before_provider_request", {}, ctx);
 		const responseHook = pi.emit("after_provider_response", { status: 429 }, ctx);
 		await pi.emit("before_provider_request", {}, ctx);
@@ -720,7 +767,7 @@ test("a new request invalidates a late quota result for the same key", async () 
 	});
 });
 
-test("session reload invalidates a pending quota decision", async () => {
+test("session start invalidates a pending quota decision", async () => {
 	await withTempConfig(async (configPath) => {
 		let resolveUsage: ((response: Awaited<ReturnType<FetchApi>>) => void) | undefined;
 		const fetch: FetchApi = async () => await new Promise((resolve) => {
@@ -728,10 +775,10 @@ test("session reload invalidates a pending quota decision", async () => {
 		});
 		const { pi, ctx, state } = createHarness("authStorage", fetch);
 
-		await pi.emit("session_start", { reason: "start" }, ctx);
+		await pi.emit("session_start", { type: "session_start" }, ctx);
 		await pi.emit("before_provider_request", {}, ctx);
 		const responseHook = pi.emit("after_provider_response", { status: 429 }, ctx);
-		await pi.emit("session_start", { reason: "reload" }, ctx);
+		await pi.emit("session_start", { type: "session_start" }, ctx);
 
 		assert.ok(resolveUsage);
 		resolveUsage({
@@ -741,7 +788,9 @@ test("session reload invalidates a pending quota decision", async () => {
 		});
 		await responseHook;
 
-		assert.equal(state.runtimeKeys.at(-1), "sk-one");
+		// The second start re-applies the active key; the late usage reading must not rotate,
+		// block it, or otherwise survive the invalidation.
+		assert.deepEqual(state.runtimeKeys, ["sk-one", "sk-one"]);
 		assert.deepEqual(readConfig(configPath).quotaBlockedUntil ?? {}, {});
 	});
 });
@@ -754,7 +803,7 @@ test("late quota usage after watchdog rotation cannot pause the new key", async 
 		});
 		const { pi, ctx, state, timers, clock } = createHarness("authStorage", fetch);
 
-		await pi.emit("session_start", { reason: "start" }, ctx);
+		await pi.emit("session_start", { type: "session_start" }, ctx);
 		await pi.emit("before_provider_request", {}, ctx);
 		const responseHook = pi.emit("after_provider_response", { status: 429 }, ctx);
 		clock.advance(90_000);
@@ -801,7 +850,7 @@ test("http 429 rotates and persists the latest authoritative usage reset", async
 		});
 		const { pi, ctx, state } = createHarness("authStorage", fetch);
 
-		await pi.emit("session_start", { reason: "start" }, ctx);
+		await pi.emit("session_start", { type: "session_start" }, ctx);
 		await pi.emit("before_provider_request", {}, ctx);
 		await pi.emit("after_provider_response", { status: 429 }, ctx);
 
@@ -819,7 +868,7 @@ test("http 401 verifies monthly quota and rotates once before retry", async () =
 			json: async () => ({ usage: { monthly: { status: "rate-limited", percent: 100, resetsAt: reset } } }),
 		});
 		const { pi, ctx, state } = createHarness("runtime", fetch);
-		await pi.emit("session_start", { reason: "start" }, ctx);
+		await pi.emit("session_start", { type: "session_start" }, ctx);
 		await pi.emit("before_provider_request", {}, ctx);
 		await pi.emit("after_provider_response", { status: 401 }, ctx);
 		assert.equal(state.runtimeKeys.at(-1), "sk-two");
@@ -839,7 +888,7 @@ test("http 401 quota rotation survives a stalled response body without rotating 
 			ok: true, status: 200,
 			json: async () => ({ usage: { monthly: { status: "rate-limited", percent: 100, resetsAt: "2026-09-01T00:00:00Z" } } }),
 		}));
-		await pi.emit("session_start", { reason: "start" }, ctx);
+		await pi.emit("session_start", { type: "session_start" }, ctx);
 		await pi.emit("before_provider_request", {}, ctx);
 		await pi.emit("after_provider_response", { status: 401 }, ctx);
 		clock.advance(90_000);
@@ -858,7 +907,7 @@ for (const usageResponse of [
 	test(`http 401 does not rotate without confirmed quota (${usageResponse.status}, ${usageResponse.ok})`, async () => {
 		await withTempConfig(async (configPath) => {
 			const { pi, ctx, state } = createHarness("runtime", async () => usageResponse);
-			await pi.emit("session_start", { reason: "start" }, ctx);
+			await pi.emit("session_start", { type: "session_start" }, ctx);
 			await pi.emit("before_provider_request", {}, ctx);
 			await pi.emit("after_provider_response", { status: 401 }, ctx);
 			await pi.emit("message_end", {
@@ -875,7 +924,7 @@ test("http 429 preserves transient rotation when usage endpoint is unavailable",
 	await withTempConfig(async () => {
 		const { pi, ctx, state, clock } = createHarness("authStorage", async () => ({ ok: false, status: 404, json: async () => ({}) }));
 
-		await pi.emit("session_start", { reason: "start" }, ctx);
+		await pi.emit("session_start", { type: "session_start" }, ctx);
 		await pi.emit("before_provider_request", {}, ctx);
 		clock.advance(6_000);
 		await pi.emit("after_provider_response", { status: 429 }, ctx);
@@ -893,11 +942,11 @@ test("expired quota blocks become eligible again", async () => {
 		}), { mode: 0o600 });
 		const { pi, ctx, state, clock } = createHarness();
 
-		await pi.emit("session_start", { reason: "start" }, ctx);
+		await pi.emit("session_start", { type: "session_start" }, ctx);
 		assert.equal(state.runtimeKeys.length, 0);
 
 		clock.advance(1_001);
-		await pi.emit("session_start", { reason: "reload" }, ctx);
+		await pi.emit("session_start", { type: "session_start" }, ctx);
 
 		assert.equal(state.runtimeKeys.at(-1), "sk-one");
 	});
@@ -993,8 +1042,8 @@ test("a stale session shutdown cannot erase a key added by another session", asy
 		const first = createHarness();
 		const second = createHarness();
 
-		await first.pi.emit("session_start", { reason: "start" }, first.ctx);
-		await second.pi.emit("session_start", { reason: "start" }, second.ctx);
+		await first.pi.emit("session_start", { type: "session_start" }, first.ctx);
+		await second.pi.emit("session_start", { type: "session_start" }, second.ctx);
 		await first.pi.runCommand("opencode", "add fresh sk-fresh", first.ctx);
 		await second.pi.emit("session_shutdown", { reason: "quit" }, second.ctx);
 
@@ -1008,8 +1057,8 @@ test("status reloads mutations made by another live session", async () => {
 		const first = createHarness();
 		const second = createHarness();
 
-		await first.pi.emit("session_start", { reason: "start" }, first.ctx);
-		await second.pi.emit("session_start", { reason: "start" }, second.ctx);
+		await first.pi.emit("session_start", { type: "session_start" }, first.ctx);
+		await second.pi.emit("session_start", { type: "session_start" }, second.ctx);
 		await first.pi.runCommand("opencode", "add fresh sk-fresh", first.ctx);
 		await second.pi.runCommand("opencode", "status", second.ctx);
 
@@ -1021,7 +1070,7 @@ test("usage reset deadlines start when the delayed response arrives", async () =
 	await withTempConfig(async (configPath) => {
 		const usage = deferred<Awaited<ReturnType<FetchApi>>>();
 		const { pi, ctx, clock } = createHarness("authStorage", async () => usage.promise);
-		await pi.emit("session_start", { reason: "start" }, ctx);
+		await pi.emit("session_start", { type: "session_start" }, ctx);
 		await pi.emit("before_provider_request", {}, ctx);
 		const pending = pi.emit("after_provider_response", { status: 429 }, ctx);
 		clock.advance(5_000);
@@ -1034,7 +1083,7 @@ test("usage reset deadlines start when the delayed response arrives", async () =
 test("a shared key selection cancels the old fast-path runtime application", async () => {
 	await withTempConfig(async () => {
 		const { pi, ctx, state } = createHarness();
-		await pi.emit("session_start", { reason: "start" }, ctx);
+		await pi.emit("session_start", { type: "session_start" }, ctx);
 		await pi.emit("before_provider_request", {}, ctx);
 		const pending = pi.emit("message_end", {
 			message: { role: "assistant", provider: "opencode-go", stopReason: "error", errorMessage: "429 Too Many Requests" },
@@ -1209,12 +1258,46 @@ const zeroUsage: Usage = {
 	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 };
 
+/**
+ * Local stand-in for the upstream `getModel("opencode-go", "minimax-m2.7")` catalog lookup:
+ * omp's pi-ai exports no `getModel`, and `Model.compat` is a required resolved record, so the
+ * fixture carries the fields that describe a third-party Anthropic-compatible reasoning
+ * endpoint (not the official Anthropic API, not a signature-enforcing proxy).
+ */
+const ANTHROPIC_MODEL: Model<"anthropic-messages"> = {
+	id: "minimax-m2.7",
+	name: "MiniMax M2.7",
+	api: "anthropic-messages",
+	provider: "opencode-go",
+	baseUrl: "https://example.test/opencode",
+	reasoning: true,
+	input: ["text"],
+	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+	contextWindow: 200_000,
+	maxTokens: 8_192,
+	compat: {
+		disableStrictTools: false,
+		disableAdaptiveThinking: false,
+		supportsEagerToolInputStreaming: true,
+		supportsLongCacheRetention: false,
+		supportsMidConversationSystem: false,
+		supportsForcedToolChoice: true,
+		supportsSamplingParams: true,
+		requiresToolResultId: false,
+		allowAnthropicHeaderOverrides: false,
+		replayUnsignedThinking: false,
+		requiresThinkingEnabled: false,
+		escapeBuiltinToolNames: false,
+		signingEndpoint: false,
+		officialEndpoint: false,
+	},
+};
+
 async function serializeAnthropicTurn(history: Context): Promise<unknown> {
-	const model = getModel("opencode-go", "minimax-m2.7");
-	assert.equal(model.api, "anthropic-messages");
+	const model = ANTHROPIC_MODEL;
 	const { pi, ctx } = createHarness();
 	Object.assign(ctx, { model });
-	await pi.emit("session_start", { reason: "start" }, ctx);
+	await pi.emit("session_start", { type: "session_start" }, ctx);
 	await pi.runCommand("opencode", "use 2", ctx);
 	let outgoing: unknown;
 	await streamAnthropic(model, history, {
@@ -1231,7 +1314,7 @@ async function serializeAnthropicTurn(history: Context): Promise<unknown> {
 
 test("real Anthropic serialization drops caller-bound reasoning before any network call", async () => {
 	await withTempConfig(async () => {
-		const model = getModel("opencode-go", "minimax-m2.7");
+		const model = ANTHROPIC_MODEL;
 		const history: Context = {
 			messages: [
 				{ role: "user", content: "Finish", timestamp: 0 },
@@ -1240,7 +1323,10 @@ test("real Anthropic serialization drops caller-bound reasoning before any netwo
 					stopReason: "toolUse", usage: zeroUsage, timestamp: 0,
 					content: [
 						{ type: "thinking", thinking: "Visible thought", thinkingSignature: "caller-bound-signature" },
-						{ type: "thinking", thinking: "", thinkingSignature: "caller-bound-ciphertext", redacted: true },
+						// omp has no `redacted` flag on thinking blocks, and its serializer drops one
+						// anyway: a signature with no visible text is the same caller-bound
+						// reasoning block the projection must discard.
+						{ type: "thinking", thinking: "", thinkingSignature: "caller-bound-ciphertext" },
 						{ type: "text", text: "Visible answer" },
 						{ type: "toolCall", id: "done", name: "write", arguments: {} },
 					],
@@ -1272,14 +1358,14 @@ test("real Anthropic serialization drops caller-bound reasoning before any netwo
 
 test("real Anthropic serialization omits an assistant turn emptied by the projection", async () => {
 	await withTempConfig(async () => {
-		const model = getModel("opencode-go", "minimax-m2.7");
+		const model = ANTHROPIC_MODEL;
 		const history: Context = {
 			messages: [
 				{ role: "user", content: "Go", timestamp: 0 },
 				{
 					role: "assistant", api: model.api, provider: model.provider, model: model.id,
 					stopReason: "stop", usage: zeroUsage, timestamp: 0,
-					content: [{ type: "thinking", thinking: "", thinkingSignature: "caller-bound-ciphertext", redacted: true }],
+					content: [{ type: "thinking", thinking: "", thinkingSignature: "caller-bound-ciphertext" }],
 				},
 				{
 					role: "assistant", api: model.api, provider: model.provider, model: model.id,
@@ -1295,7 +1381,12 @@ test("real Anthropic serialization omits an assistant turn emptied by the projec
 		const serialized = outgoing as { messages: unknown[] };
 		assert.deepEqual(serialized.messages, [
 			{ role: "user", content: "Go" },
+			// The serializer repairs the adjacent assistant turns, then the trailing assistant,
+			// with this neutral continuation before the projection runs. The emptied turn itself
+			// is gone; only these repairs and the surviving turn reach the wire.
+			{ role: "user", content: "Continue." },
 			{ role: "assistant", content: [{ type: "text", text: "Kept" }] },
+			{ role: "user", content: "Continue." },
 		]);
 		assert.deepEqual(history, original);
 	});
@@ -1317,7 +1408,7 @@ test("recovery clears a blocked key with confirmed headroom and rotates to it", 
 		patchConfig(configPath, { keys: twoKeys, quotaBlockedUntil: { 1: 9_999_999 } });
 		const { pi, ctx, state } = createHarness("authStorage", async () => activeUsage());
 
-		await pi.emit("session_start", { reason: "start" }, ctx);
+		await pi.emit("session_start", { type: "session_start" }, ctx);
 		await pi.emit("before_provider_request", {}, ctx);
 		await pi.emit("message_end", assistantError(transientError), ctx);
 
@@ -1333,7 +1424,7 @@ test("late transient recovery cannot override a manual key selection", async () 
 		const usage = deferred<Awaited<ReturnType<FetchApi>>>();
 		const { pi, ctx, state } = createHarness("authStorage", async () => usage.promise);
 
-		await pi.emit("session_start", { reason: "start" }, ctx);
+		await pi.emit("session_start", { type: "session_start" }, ctx);
 		await pi.emit("before_provider_request", {}, ctx);
 		const pending = pi.emit("message_end", assistantError(transientError), ctx);
 		await pi.runCommand("opencode", "use 1", ctx);
@@ -1359,7 +1450,7 @@ test("late after-response recovery cannot override a manual key selection", asyn
 			return await recovery.promise;
 		});
 
-		await pi.emit("session_start", { reason: "start" }, ctx);
+		await pi.emit("session_start", { type: "session_start" }, ctx);
 		await pi.emit("before_provider_request", {}, ctx);
 		const pending = pi.emit("after_provider_response", { status: 429 }, ctx);
 		await started;
@@ -1378,7 +1469,7 @@ test("late recovery cannot quota-block a replacement for a removed failed key", 
 		const usage = deferred<Awaited<ReturnType<FetchApi>>>();
 		const { pi, ctx } = createHarness("authStorage", async () => usage.promise);
 
-		await pi.emit("session_start", { reason: "start" }, ctx);
+		await pi.emit("session_start", { type: "session_start" }, ctx);
 		await pi.emit("before_provider_request", {}, ctx);
 		const pending = pi.emit("message_end", assistantError(fixedWindowError), ctx);
 		await pi.runCommand("opencode", "rm 2", ctx);
@@ -1406,7 +1497,7 @@ test("stale after-response bookkeeping cannot suppress the next request rotation
 			return await recovery.promise;
 		});
 
-		await pi.emit("session_start", { reason: "start" }, ctx);
+		await pi.emit("session_start", { type: "session_start" }, ctx);
 		await pi.emit("before_provider_request", {}, ctx);
 		const pending = pi.emit("after_provider_response", { status: 429 }, ctx);
 		await started;
@@ -1427,7 +1518,7 @@ test("a stale startup recovery cannot override a manual key selection", async ()
 		const usage = deferred<Awaited<ReturnType<FetchApi>>>();
 		const { pi, ctx } = createHarness("authStorage", async () => usage.promise);
 
-		const startup = pi.emit("session_start", { reason: "start" }, ctx);
+		const startup = pi.emit("session_start", { type: "session_start" }, ctx);
 		await pi.runCommand("opencode", "use 3", ctx);
 		usage.resolve(activeUsage());
 		await startup;
@@ -1451,7 +1542,7 @@ for (const { name, mutate } of snapshotMutations) {
 			const usage = deferred<Awaited<ReturnType<FetchApi>>>();
 			const { pi, ctx } = createHarness("authStorage", async () => usage.promise);
 
-			const startup = pi.emit("session_start", { reason: "start" }, ctx);
+			const startup = pi.emit("session_start", { type: "session_start" }, ctx);
 			updateConfig((config) => mutate(config));
 			const afterMutation = readConfig(configPath);
 			usage.resolve(activeUsage());
@@ -1475,7 +1566,7 @@ for (const { name, response, cleared } of [
 			patchConfig(configPath, { quotaBlockedUntil: { 0: 9_999_999 } });
 			const { pi, ctx, state } = createHarness("authStorage", async () => response);
 
-			await pi.emit("session_start", { reason: "start" }, ctx);
+			await pi.emit("session_start", { type: "session_start" }, ctx);
 
 			assert.equal(readConfig(configPath).quotaBlockedUntil?.["0"], cleared ? undefined : 9_999_999);
 			// Recovery never replaces the startup fallback: an uncertain reading leaves the
@@ -1491,7 +1582,7 @@ test("a late headroom snapshot cannot erase a newer shared-session quota block",
 		const usage = deferred<Awaited<ReturnType<FetchApi>>>();
 		const { pi, ctx } = createHarness("authStorage", async () => usage.promise);
 
-		const startup = pi.emit("session_start", { reason: "start" }, ctx);
+		const startup = pi.emit("session_start", { type: "session_start" }, ctx);
 		updateConfig((config) => { config.quotaBlockedUntil[0] = 19_999_999; });
 		usage.resolve(activeUsage());
 		await startup;
@@ -1505,7 +1596,7 @@ test("a superseded response cannot rotate or finalize after a newer request star
 		const fetch: FetchApi = async () => ({ ok: false, status: 404, json: async () => ({}) });
 		const { pi, ctx, state } = createHarness("authStorage", fetch);
 
-		await pi.emit("session_start", { reason: "start" }, ctx);
+		await pi.emit("session_start", { type: "session_start" }, ctx);
 		await pi.emit("before_provider_request", {}, ctx);
 		const pending = pi.emit("after_provider_response", { status: 429 }, ctx);
 		await pi.emit("before_provider_request", {}, ctx);
@@ -1521,7 +1612,7 @@ test("a fast-path message_end rotation cannot notify after a newer request start
 	await withTempConfig(async () => {
 		const { pi, ctx, state } = createHarness();
 
-		await pi.emit("session_start", { reason: "start" }, ctx);
+		await pi.emit("session_start", { type: "session_start" }, ctx);
 		await pi.emit("before_provider_request", {}, ctx);
 		const pending = pi.emit("message_end", assistantError(transientError), ctx);
 		await pi.emit("before_provider_request", {}, ctx);
@@ -1537,7 +1628,7 @@ test("a stale uncertain recovery cannot report exhaustion for a superseded decis
 		const usage = deferred<Awaited<ReturnType<FetchApi>>>();
 		const { pi, ctx, state } = createHarness("authStorage", async () => usage.promise);
 
-		await pi.emit("session_start", { reason: "start" }, ctx);
+		await pi.emit("session_start", { type: "session_start" }, ctx);
 		await pi.emit("before_provider_request", {}, ctx);
 		const pending = pi.emit("message_end", assistantError(transientError), ctx);
 		await pi.runCommand("opencode", "use 1", ctx);
