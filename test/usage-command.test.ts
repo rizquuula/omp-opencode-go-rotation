@@ -98,8 +98,10 @@ function createContext(state: FakeContextState): ExtensionContext {
 		modelRegistry: {
 			getApiKeyForProvider: async () => undefined,
 			authStorage: {
-				setRuntimeApiKey: () => {},
-				removeRuntimeApiKey: () => {},
+				keys: {
+					setRuntime: () => {},
+					removeRuntime: () => {},
+				},
 			},
 		},
 		ui: {

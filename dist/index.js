@@ -259,10 +259,23 @@ function sanitizeReasoningPayload(payload) {
 }
 const lastAppliedRuntimeKeys = new WeakMap();
 function getRuntimeKeyStore(modelRegistry) {
-    const store = modelRegistry.authStorage ?? modelRegistry.runtime;
-    if (!store)
+    const storage = modelRegistry.authStorage ?? modelRegistry.runtime;
+    if (!storage)
         throw new Error("Model registry does not expose runtime API key storage");
-    return store;
+    const keys = storage.keys;
+    if (typeof keys?.setRuntime === "function" && typeof keys.removeRuntime === "function") {
+        return {
+            setRuntime: (provider, key) => keys.setRuntime(provider, key),
+            removeRuntime: (provider) => keys.removeRuntime(provider),
+        };
+    }
+    if (typeof storage.setRuntimeApiKey === "function" && typeof storage.removeRuntimeApiKey === "function") {
+        return {
+            setRuntime: (provider, key) => storage.setRuntimeApiKey(provider, key),
+            removeRuntime: (provider) => storage.removeRuntimeApiKey(provider),
+        };
+    }
+    throw new Error("Model registry does not expose a supported runtime API key setter");
 }
 function ignoreAsyncRefresh(result) {
     void result?.catch(() => { });
@@ -277,7 +290,7 @@ function applyActiveKey(config, modelRegistry, now = Date.now()) {
     const key = config.keys[idx].key;
     if (lastAppliedRuntimeKeys.get(modelRegistry) !== key) {
         lastAppliedRuntimeKeys.set(modelRegistry, key);
-        ignoreAsyncRefresh(getRuntimeKeyStore(modelRegistry).setRuntimeApiKey(PROVIDER, key));
+        ignoreAsyncRefresh(getRuntimeKeyStore(modelRegistry).setRuntime(PROVIDER, key));
     }
     return config.keys[idx].name || `key-${idx + 1}`;
 }
@@ -1375,7 +1388,7 @@ export function createOpencodeGoRotationExtension(options = {}) {
                             applyActiveKey(config, ctx.modelRegistry, now());
                         else {
                             lastAppliedRuntimeKeys.delete(ctx.modelRegistry);
-                            ignoreAsyncRefresh(getRuntimeKeyStore(ctx.modelRegistry).removeRuntimeApiKey(PROVIDER));
+                            ignoreAsyncRefresh(getRuntimeKeyStore(ctx.modelRegistry).removeRuntime(PROVIDER));
                         }
                         ctx.ui.notify(`Removed "${result.removedName}" (${result.count} left)`, "info");
                         break;

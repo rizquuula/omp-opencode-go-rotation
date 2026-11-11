@@ -119,7 +119,9 @@ interface FakeContextState {
 	aborts: number;
 }
 
-function createContext(state: FakeContextState, registryShape: "authStorage" | "runtime" = "authStorage"): ExtensionContext {
+type RegistryShape = "keys" | "authStorage" | "runtime";
+
+function createContext(state: FakeContextState, registryShape: RegistryShape = "keys"): ExtensionContext {
 	const keyStore = {
 		setRuntimeApiKey: (_provider: string, key: string) => {
 			state.runtimeKeys.push(key);
@@ -128,11 +130,23 @@ function createContext(state: FakeContextState, registryShape: "authStorage" | "
 			state.runtimeKeys.push("removed");
 		},
 	};
+	const authStorage = registryShape === "keys"
+		? {
+			keys: {
+				setRuntime: (_provider: string, key: string) => {
+					state.runtimeKeys.push(key);
+				},
+				removeRuntime: (_provider: string) => {
+					state.runtimeKeys.push("removed");
+				},
+			},
+		}
+		: keyStore;
 	const context = {
 		model: { provider: "opencode-go", baseUrl: "https://example.test/opencode" },
 		modelRegistry: {
 			getApiKeyForProvider: async () => undefined,
-			[registryShape]: keyStore,
+			[registryShape === "keys" ? "authStorage" : registryShape]: authStorage,
 		},
 		ui: {
 			notify: (message: string) => {
@@ -219,7 +233,7 @@ async function withTempConfig(run: (configPath: string) => Promise<void>): Promi
 	}
 }
 
-function createHarness(registryShape: "authStorage" | "runtime" = "authStorage", fetch: FetchApi = async () => ({ ok: false, status: 404, json: async () => ({}) })): { pi: FakePi; ctx: ExtensionContext; state: FakeContextState; timers: FakeTimers; clock: FakeClock } {
+function createHarness(registryShape: RegistryShape = "keys", fetch: FetchApi = async () => ({ ok: false, status: 404, json: async () => ({}) })): { pi: FakePi; ctx: ExtensionContext; state: FakeContextState; timers: FakeTimers; clock: FakeClock } {
 	const timers = new FakeTimers();
 	const clock = new FakeClock();
 	const pi = new FakePi();
@@ -258,9 +272,9 @@ test("usage helpers parse the upstream response shape", () => {
 	assert.deepEqual(parseOpenCodeGoUsage({ windows: [{ name: "5-hour", status: "bad" }] }), { windows: [{ name: "5-hour", status: "unknown" }] });
 });
 
-test("session start supports the current model registry runtime store", async () => {
+test("session start supports the current authStorage key store", async () => {
 	await withTempConfig(async () => {
-		const { pi, ctx, state } = createHarness("runtime");
+		const { pi, ctx, state } = createHarness("keys");
 
 		await pi.emit("session_start", { type: "session_start" }, ctx);
 
@@ -268,9 +282,19 @@ test("session start supports the current model registry runtime store", async ()
 	});
 });
 
+test("session start supports legacy runtime API key stores", async () => {
+	await withTempConfig(async () => {
+		for (const shape of ["runtime", "authStorage"] as const) {
+			const { pi, ctx, state } = createHarness(shape);
+			await pi.emit("session_start", { type: "session_start" }, ctx);
+			assert.equal(state.runtimeKeys.at(-1), "sk-one");
+		}
+	});
+});
+
 test("runtime registry supports repeated session starts and final-key removal", async () => {
 	await withTempConfig(async () => {
-		const { pi, ctx, state } = createHarness("runtime");
+		const { pi, ctx, state } = createHarness("keys");
 		await pi.emit("session_start", { type: "session_start" }, ctx);
 		await pi.emit("session_start", { type: "session_start" }, ctx);
 		assert.deepEqual(state.runtimeKeys, ["sk-one", "sk-one"]);

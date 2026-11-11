@@ -281,8 +281,22 @@ function rotateToNextKey(config: Config, options: RotateOptions = {}): number | 
 
 
 interface RuntimeKeyStore {
-	setRuntimeApiKey(provider: string, key: string): void | Promise<void>;
-	removeRuntimeApiKey(provider: string): void | Promise<void>;
+	setRuntime(provider: string, key: string): void | Promise<void>;
+	removeRuntime(provider: string): void | Promise<void>;
+}
+
+/**
+ * Credential storage shapes seen across omp and pi runtimes.
+ * - `keys`: current omp `AuthStorage.keys.setRuntime`/`removeRuntime`.
+ * - `setRuntimeApiKey`: older omp AuthStorage and earendil ModelRuntime.
+ */
+interface RawKeyStorage {
+	setRuntimeApiKey?(provider: string, key: string): void | Promise<void>;
+	removeRuntimeApiKey?(provider: string): void | Promise<void>;
+	keys?: {
+		setRuntime?(provider: string, key: string): void | Promise<void>;
+		removeRuntime?(provider: string): void | Promise<void>;
+	};
 }
 
 // Key equality detects credential changes, but persisted history has no issuer
@@ -371,10 +385,23 @@ function sanitizeReasoningPayload(payload: unknown): unknown {
 
 const lastAppliedRuntimeKeys = new WeakMap<object, string>();
 
-function getRuntimeKeyStore(modelRegistry: { authStorage?: RuntimeKeyStore; runtime?: RuntimeKeyStore }): RuntimeKeyStore {
-	const store = modelRegistry.authStorage ?? modelRegistry.runtime;
-	if (!store) throw new Error("Model registry does not expose runtime API key storage");
-	return store;
+function getRuntimeKeyStore(modelRegistry: { authStorage?: RawKeyStorage; runtime?: RawKeyStorage }): RuntimeKeyStore {
+	const storage = modelRegistry.authStorage ?? modelRegistry.runtime;
+	if (!storage) throw new Error("Model registry does not expose runtime API key storage");
+	const keys = storage.keys;
+	if (typeof keys?.setRuntime === "function" && typeof keys.removeRuntime === "function") {
+		return {
+			setRuntime: (provider, key) => keys.setRuntime!(provider, key),
+			removeRuntime: (provider) => keys.removeRuntime!(provider),
+		};
+	}
+	if (typeof storage.setRuntimeApiKey === "function" && typeof storage.removeRuntimeApiKey === "function") {
+		return {
+			setRuntime: (provider, key) => storage.setRuntimeApiKey!(provider, key),
+			removeRuntime: (provider) => storage.removeRuntimeApiKey!(provider),
+		};
+	}
+	throw new Error("Model registry does not expose a supported runtime API key setter");
 }
 
 function ignoreAsyncRefresh(result: void | Promise<void>): void {
@@ -382,14 +409,14 @@ function ignoreAsyncRefresh(result: void | Promise<void>): void {
 }
 
 /** Set the active key as runtime override (highest priority in auth chain). */
-function applyActiveKey(config: Config, modelRegistry: { authStorage?: RuntimeKeyStore; runtime?: RuntimeKeyStore }, now = Date.now()): string | undefined {
+function applyActiveKey(config: Config, modelRegistry: { authStorage?: RawKeyStorage; runtime?: RawKeyStorage }, now = Date.now()): string | undefined {
 	const idx = pickAvailableKeyIndex(config, now);
 	if (idx === undefined) return undefined;
 	if (config.activeKeyIndex !== idx) config.activeKeyIndex = idx;
 	const key = config.keys[idx].key;
 	if (lastAppliedRuntimeKeys.get(modelRegistry) !== key) {
 		lastAppliedRuntimeKeys.set(modelRegistry, key);
-		ignoreAsyncRefresh(getRuntimeKeyStore(modelRegistry).setRuntimeApiKey(PROVIDER, key));
+		ignoreAsyncRefresh(getRuntimeKeyStore(modelRegistry).setRuntime(PROVIDER, key));
 	}
 	return config.keys[idx].name || `key-${idx + 1}`;
 }
@@ -1511,7 +1538,7 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 						if (config.keys.length > 0) applyActiveKey(config, ctx.modelRegistry, now());
 						else {
 							lastAppliedRuntimeKeys.delete(ctx.modelRegistry);
-							ignoreAsyncRefresh(getRuntimeKeyStore(ctx.modelRegistry).removeRuntimeApiKey(PROVIDER));
+							ignoreAsyncRefresh(getRuntimeKeyStore(ctx.modelRegistry).removeRuntime(PROVIDER));
 						}
 						ctx.ui.notify(`Removed "${result.removedName}" (${result.count} left)`, "info");
 						break;
